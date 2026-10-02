@@ -120,24 +120,62 @@ export function diffFollowed(prev: FollowedTrader[], next: FollowedTrader[]) {
 
 // --- Feed post filtering ---
 
-export type SignalAction = 'open' | 'increase' | 'close';
+/**
+ * open:   a new trade (the post says so: changes.isAdded === true)
+ * update: any other change to an open trade. Invo's post doesn't say whether
+ *         the trader added, reduced or just edited it, so it is never copied
+ *         automatically — a reduce copied as an add would grow our position.
+ * close:  the trade is closed (isOpen === false)
+ */
+export type SignalAction = 'open' | 'update' | 'close';
 
 export type PostVerdict =
   | { kind: 'ignore' } // not a trade post — silently skipped
   | { kind: 'reject'; reason: string; ownerId?: string; portfolioId?: string }
-  | { kind: 'accept'; trader: FollowedTrader; portfolio: FollowedPortfolio; action: SignalAction };
+  | {
+      kind: 'accept';
+      /** null for a close of a trade we copied from someone no longer followed */
+      trader: FollowedTrader | null;
+      portfolio: FollowedPortfolio | null;
+      action: SignalAction;
+      /** We hold an open copy of this trade (close signals only). */
+      copied: boolean;
+    };
+
+/** Do we hold an open copy of this trader's trade? */
+export type CopiedTradeCheck = (ownerId: string, baseId: string | undefined, baseShortId: string | undefined) => boolean;
+
+export function signalAction(update: any): SignalAction {
+  // A closed trade is a close even without a closing price: treating it as an
+  // update would ask whether to add to a position the trader has left
+  if (update.isOpen === false) return 'close';
+  if (update.isOpen === true && update.changes?.isAdded === true) return 'open';
+  return 'update';
+}
 
 /**
  * Decide whether a feed post is a verified trade signal from a trader the
  * account currently follows. Pure — `followed` is the current list.
+ *
+ * A close of a trade we hold a copy of is let through even if the trader is
+ * no longer followed, the portfolio can't be resolved, or the post is a repost:
+ * dropping it would leave our copy open, and close.ts only acts on it if the
+ * copy ledger matches.
  */
-export function classifyPost(post: any, followed: Map<string, FollowedTrader>): PostVerdict {
+export function classifyPost(post: any, followed: Map<string, FollowedTrader>, isCopied: CopiedTradeCheck = () => false): PostVerdict {
   const update = post?.update;
   if (!update || !update.ticker) return { kind: 'ignore' };
 
   const ownerId: string | undefined = update.owner?.id;
   const portfolioId: string | undefined = update.portfolio?.id;
   const ctx = { ownerId, portfolioId };
+  const action = signalAction(update);
+
+  if (action === 'close' && ownerId && isCopied(ownerId, update.baseId || undefined, update.baseShortId || undefined)) {
+    const trader = followed.get(ownerId) ?? null;
+    const portfolio = trader?.portfolios.find(p => p.id === portfolioId) ?? null;
+    return { kind: 'accept', trader, portfolio, action, copied: true };
+  }
 
   if (update.verifiedTrade !== true) return { kind: 'reject', reason: 'unverified trade', ...ctx };
   if (!ownerId) return { kind: 'reject', reason: 'trade has no owner', ...ctx };
@@ -150,19 +188,12 @@ export function classifyPost(post: any, followed: Map<string, FollowedTrader>): 
   const portfolio = trader.portfolios.find(p => p.id === portfolioId);
   if (!portfolio) return { kind: 'reject', reason: 'portfolio not owned by followed trader', ...ctx };
 
-  // Same action rules the monitor has always used
-  const isClosed = update.isOpen === false && update.closingPrice != null;
-  let action: SignalAction;
-  if (isClosed) action = 'close';
-  else if (update.changes?.isAdded !== false) action = 'open';
-  else action = 'increase';
-
-  // Opens/increases are copied with trade.ts, which needs the trader's trade IDs.
-  // Closes don't (close.ts works by coin), and dropping one would leave our copy open.
+  // Opens/updates can only be copied with trade.ts, which needs the trader's trade IDs.
+  // Closes don't strictly (close.ts refuses one it can't match), and dropping one would leave our copy open.
   if (action !== 'close') {
     const missing = missingMimicMetaFields(mimicMetaFromUpdate(update));
     if (missing.length) return { kind: 'reject', reason: `trade is missing ${missing.join(', ')}`, ...ctx };
   }
 
-  return { kind: 'accept', trader, portfolio, action };
+  return { kind: 'accept', trader, portfolio, action, copied: false };
 }

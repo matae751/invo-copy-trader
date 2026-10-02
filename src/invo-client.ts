@@ -1,3 +1,5 @@
+import { timeoutSignal } from './timeout.js';
+
 const BASE = 'https://api.invoapp.com';
 
 let token = '';
@@ -16,6 +18,7 @@ async function refreshAccessToken(): Promise<boolean> {
   try {
     const resp = await fetch(`${BASE}/v1_0/auth/refresh_token`, {
       method: 'GET',
+      ...timeoutSignal(),
       headers: {
         Authorization: `Bearer ${refreshToken}`,
         'x-app-version': '0.0.75',
@@ -53,6 +56,7 @@ async function post(path: string, body: any, retried = false): Promise<any> {
   await ensureToken();
   const resp = await fetch(`${BASE}${path}`, {
     method: 'POST',
+    ...timeoutSignal(),
     headers: {
       Authorization: token,
       'Content-Type': 'application/json',
@@ -84,6 +88,7 @@ async function get(path: string, retried = false): Promise<any> {
   await ensureToken();
   const resp = await fetch(`${BASE}${path}`, {
     headers: { Authorization: token },
+    ...timeoutSignal(),
   });
   if (resp.status === 401 && !retried) {
     const ok = await refreshAccessToken();

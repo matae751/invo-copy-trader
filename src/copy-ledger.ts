@@ -29,10 +29,32 @@ export interface CopyEntry {
   qty: number;
   source: CopySource | null;
   positionRecordIds: string[];
-  status: 'open' | 'closed';
+  /** The trader's updates (mimicMeta.initialSourcePaperUpdateId) copied into this entry. Absent on older entries. */
+  sourceUpdateIds?: string[];
+  /** 'pending' = a new copy whose opening order hasn't been settled yet (qty 0 until it is). */
+  status: 'pending' | 'open' | 'closed';
+  /** An order placed for this entry whose fill isn't recorded yet (see settleOrder). */
+  pendingOrder?: PendingOrder;
   openedAt: string;
   updatedAt: string;
   closedAt?: string;
+  /** Set when the entry was closed by reconciliation rather than by an order. */
+  closeReason?: string;
+}
+
+/**
+ * Written to the ledger before an order is sent, and cleared once its fill is
+ * recorded. If the process dies in between, the next run in that coin looks the
+ * order up on HL by `cloid` and settles it, so a fill is never left untracked.
+ */
+export interface PendingOrder {
+  kind: 'open' | 'close';
+  /** Hyperliquid client order id sent with the order. */
+  cloid: string;
+  requestedQty: number;
+  /** open: the trader update being copied — released again if nothing fills. */
+  sourceUpdateId?: string | null;
+  placedAt: string;
 }
 
 export interface LedgerStore {
@@ -80,23 +102,38 @@ export const floorQty = (x: number, szDecimals: number) =>
 
 // --- Opening ---
 
-export interface CopyOpen {
-  id: string;
+export interface OpenIntent {
+  id: string; // clientTxId: the new entry's id if this starts a new copy
   coin: string;
   side: Side;
-  qty: number; // filled coin units
-  szDecimals: number;
   source: CopySource | null;
-  positionRecordId: string | null;
+  /** The trader update being copied; null for a manual trade. */
+  sourceUpdateId: string | null;
+  cloid: string;
+  requestedQty: number;
   now: string;
 }
 
 /**
- * Record a fill. A further fill on the same trader's same trade (an increase)
- * adds to that copy; anything else — another trader, another trade of theirs,
- * a manual trade — is its own entry.
+ * The entry (pending, open or closed) that already copied this trader update,
+ * if any. Each update is copied at most once, so a repeated signal can't add again.
  */
-export function recordCopyOpen(entries: CopyEntry[], open: CopyOpen): { entries: CopyEntry[]; entry: CopyEntry } {
+export function findCopiedUpdate(entries: CopyEntry[], updateId: string): CopyEntry | undefined {
+  return entries.find(e => e.sourceUpdateIds?.includes(updateId));
+}
+
+/**
+ * Record an opening order before it is sent. A further order on the same
+ * trader's same trade (an increase) goes on that copy; anything else — another
+ * trader, another trade of theirs, a manual trade — starts a pending entry.
+ * The update id is claimed now, so a concurrent or repeated signal is refused.
+ */
+export function beginOpen(entries: CopyEntry[], open: OpenIntent): { entries: CopyEntry[]; entryId: string } {
+  const pendingOrder: PendingOrder = {
+    kind: 'open', cloid: open.cloid, requestedQty: open.requestedQty, sourceUpdateId: open.sourceUpdateId, placedAt: open.now,
+  };
+  const withUpdate = (ids: string[] | undefined) => (open.sourceUpdateId ? [...(ids ?? []), open.sourceUpdateId] : ids);
+
   const existing = open.source
     ? entries.find(e =>
         e.status === 'open' &&
@@ -107,27 +144,116 @@ export function recordCopyOpen(entries: CopyEntry[], open: CopyOpen): { entries:
     : undefined;
 
   if (existing) {
-    const entry: CopyEntry = {
-      ...existing,
-      qty: roundQty(existing.qty + open.qty, open.szDecimals),
-      positionRecordIds: open.positionRecordId ? [...existing.positionRecordIds, open.positionRecordId] : existing.positionRecordIds,
-      updatedAt: open.now,
-    };
-    return { entries: entries.map(e => (e.id === existing.id ? entry : e)), entry };
+    if (existing.pendingOrder) throw new Error(`ledger entry ${existing.id} already has an unsettled order`);
+    const entry: CopyEntry = { ...existing, sourceUpdateIds: withUpdate(existing.sourceUpdateIds), pendingOrder, updatedAt: open.now };
+    return { entries: entries.map(e => (e.id === existing.id ? entry : e)), entryId: existing.id };
   }
 
+  const ids = withUpdate(undefined);
   const entry: CopyEntry = {
     id: open.id,
     coin: open.coin,
     side: open.side,
-    qty: roundQty(open.qty, open.szDecimals),
+    qty: 0,
     source: open.source,
-    positionRecordIds: open.positionRecordId ? [open.positionRecordId] : [],
-    status: 'open',
+    positionRecordIds: [],
+    ...(ids && { sourceUpdateIds: ids }),
+    status: 'pending',
+    pendingOrder,
     openedAt: open.now,
     updatedAt: open.now,
   };
-  return { entries: [...entries, entry], entry };
+  return { entries: [...entries, entry], entryId: entry.id };
+}
+
+/** Record a closing order for `entryId` before it is sent. */
+export function beginClose(entries: CopyEntry[], entryId: string, cloid: string, requestedQty: number, now: string): CopyEntry[] {
+  return entries.map(e => {
+    if (e.id !== entryId) return e;
+    if (e.pendingOrder) throw new Error(`ledger entry ${e.id} already has an unsettled order`);
+    return { ...e, pendingOrder: { kind: 'close' as const, cloid, requestedQty, placedAt: now }, updatedAt: now };
+  });
+}
+
+/**
+ * Record what an entry's pending order filled and clear it.
+ *   open:  qty grows by the fill. A new copy with no fill is removed; an increase
+ *          with no fill releases its update id, so the update can be retried.
+ *   close: qty shrinks by the fill; the entry is closed once nothing is left.
+ */
+export function settleOrder(
+  entries: CopyEntry[],
+  entryId: string,
+  filledQty: number,
+  szDecimals: number,
+  now: string,
+  positionRecordId: string | null = null,
+): CopyEntry[] {
+  const eps = qtyEpsilon(szDecimals);
+  const filled = roundQty(Math.max(0, filledQty), szDecimals);
+  const out: CopyEntry[] = [];
+  for (const e of entries) {
+    if (e.id !== entryId) {
+      out.push(e);
+      continue;
+    }
+    const { pendingOrder: p, ...rest } = e;
+    if (!p) throw new Error(`ledger entry ${entryId} has no pending order`);
+
+    if (p.kind === 'close') {
+      const left = roundQty(e.qty - filled, szDecimals);
+      out.push(left < eps
+        ? { ...rest, qty: 0, status: 'closed', updatedAt: now, closedAt: now }
+        : { ...rest, qty: left, updatedAt: now });
+    } else if (filled < eps) {
+      if (e.status === 'pending') continue; // nothing filled: the copy never existed
+      out.push({ ...rest, sourceUpdateIds: e.sourceUpdateIds?.filter(id => id !== p.sourceUpdateId), updatedAt: now });
+    } else {
+      out.push({
+        ...rest,
+        qty: roundQty(e.qty + filled, szDecimals),
+        status: 'open',
+        positionRecordIds: positionRecordId ? [...e.positionRecordIds, positionRecordId] : e.positionRecordIds,
+        updatedAt: now,
+      });
+    }
+  }
+  return out;
+}
+
+/** Entries in `coin` with an order that was placed but never settled. */
+export const unsettledInCoin = (entries: CopyEntry[], coin: string) =>
+  entries.filter(e => e.coin === coin && e.pendingOrder);
+
+// --- Reconciling with the live position ---
+
+/**
+ * Close open entries in `coin` that the live HL position shows can no longer
+ * exist: the position is flat, or on the other side (it went through zero).
+ * This happens after a liquidation, TP/SL, or a close made outside this tool;
+ * left open, those entries would make every later close in the coin refuse.
+ * A same-side position smaller than the entries is left alone — whose share
+ * is gone can't be told, so planCopyClose still refuses that.
+ */
+export function reconcileWithPosition(
+  entries: CopyEntry[],
+  coin: string,
+  positionSzi: number,
+  szDecimals: number,
+  now: string,
+): { entries: CopyEntry[]; reconciled: string[] } {
+  const flat = Math.abs(positionSzi) < qtyEpsilon(szDecimals);
+  const side: Side = positionSzi > 0 ? 'long' : 'short';
+  const reconciled: string[] = [];
+  const next = entries.map(e => {
+    if (e.status !== 'open' || e.coin !== coin || (!flat && e.side === side)) return e;
+    reconciled.push(e.id);
+    const closeReason = flat
+      ? `reconciled: no ${coin} position on Hyperliquid`
+      : `reconciled: ${coin} position is ${side}, entry was ${e.side}`;
+    return { ...e, qty: 0, status: 'closed' as const, updatedAt: now, closedAt: now, closeReason };
+  });
+  return { entries: reconciled.length ? next : entries, reconciled };
 }
 
 // --- Closing ---
@@ -154,18 +280,23 @@ export function parseCloseIdentity(raw: unknown): CloseIdentity {
 
 export type CopyMatch = { kind: 'match'; entry: CopyEntry } | { kind: 'refuse'; reason: string };
 
+/** Does this copy belong to the trader's trade? Manual entries never do. */
+export function isSameTrade(source: CopySource | null, id: CloseIdentity): boolean {
+  if (!source || source.creatorInvoUserId !== id.creatorInvoUserId) return false;
+  // baseId is the trade's own id (a UUID) and identifies it on its own. Invo's
+  // baseShortId isn't known to be the same on every post of a trade, so it is
+  // only used when the signal has no baseId.
+  return id.sourcePaperTradeBaseId !== undefined
+    ? source.sourcePaperTradeBaseId === id.sourcePaperTradeBaseId
+    : source.sourcePaperTradeBaseShortId === id.sourcePaperTradeBaseShortId;
+}
+
 /**
- * The open copy a close signal refers to: same coin, same trader, same trade.
- * Every trade ID the signal carries must agree. Manual entries never match.
+ * The open copy a close signal refers to: same coin, same trader, same trade
+ * (see isSameTrade). Manual entries never match.
  */
 export function findCopyToClose(entries: CopyEntry[], coin: string, id: CloseIdentity): CopyMatch {
-  const matches = entries.filter(e =>
-    e.status === 'open' &&
-    e.coin === coin &&
-    e.source !== null &&
-    e.source.creatorInvoUserId === id.creatorInvoUserId &&
-    (id.sourcePaperTradeBaseId === undefined || e.source.sourcePaperTradeBaseId === id.sourcePaperTradeBaseId) &&
-    (id.sourcePaperTradeBaseShortId === undefined || e.source.sourcePaperTradeBaseShortId === id.sourcePaperTradeBaseShortId));
+  const matches = entries.filter(e => e.status === 'open' && e.coin === coin && isSameTrade(e.source, id));
 
   if (matches.length === 1) return { kind: 'match', entry: matches[0] };
   if (matches.length > 1) return { kind: 'refuse', reason: `${matches.length} open ${coin} copies match this signal — ledger is ambiguous, close manually` };
@@ -205,16 +336,6 @@ export function planCopyClose(entry: CopyEntry, entries: CopyEntry[], positionSz
   const qty = floorQty(Math.min(entry.qty, posQty), szDecimals);
   if (qty < eps) return { kind: 'refuse', reason: `copy quantity ${entry.qty} rounds to zero at ${szDecimals} decimals` };
   return { kind: 'close', qty, isLong, full: qty >= posQty - eps };
-}
-
-/** Take `closedQty` off the entry; it is closed once nothing is left. */
-export function applyCopyClose(entries: CopyEntry[], entryId: string, closedQty: number, szDecimals: number, now: string): CopyEntry[] {
-  return entries.map(e => {
-    if (e.id !== entryId) return e;
-    const left = roundQty(e.qty - closedQty, szDecimals);
-    if (left < qtyEpsilon(szDecimals)) return { ...e, qty: 0, status: 'closed', updatedAt: now, closedAt: now };
-    return { ...e, qty: left, updatedAt: now };
-  });
 }
 
 /** After an explicit manual full close: every open entry in the coin is gone. */

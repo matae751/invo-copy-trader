@@ -1,48 +1,71 @@
 import { validateEnv, INVO_TOKEN, INVO_REFRESH_TOKEN } from '../env.js';
 import * as invo from '../invo-client.js';
 import { FollowedTraderRegistry } from '../followed-registry.js';
-import { classifyPost } from '../following.js';
-import { mimicMetaFromUpdate } from '../mimic-meta.js';
+import { FileLedgerStore, defaultLedgerPath } from '../copy-ledger.js';
+import {
+  SignalWatcher,
+  FileStateStore,
+  defaultMonitorStatePath,
+  followingSummary,
+  DEFAULT_MAX_CATCHUP_SEC,
+  DEFAULT_MAX_SIGNAL_AGE_SEC,
+  type WatchEntry,
+  type WatchEvent,
+} from '../signal-watcher.js';
 
 validateEnv();
 if (INVO_TOKEN) invo.setToken(INVO_TOKEN);
 if (INVO_REFRESH_TOKEN) invo.setRefreshToken(INVO_REFRESH_TOKEN);
 
-interface WatchEntry {
-  baseShortId: string;
-  mimicStartedAt: string;
-}
-
 const DEFAULT_REFRESH_SEC = 60;
+const FEED_INTERVAL = 5_000; // 5s for faster signal detection
 
 function usage(): never {
-  console.error('Usage: monitor [--wait-for-signal] [--refresh=<sec>] [watchEntries]');
+  console.error('Usage: monitor [--wait-for-signal] [--refresh=<sec>] [--max-catchup=<sec>] [--max-signal-age=<sec>] [watchEntries]');
   console.error('');
   console.error('Traders are the users your Invo account currently follows — loaded at startup');
   console.error(`and re-fetched every --refresh seconds (default ${DEFAULT_REFRESH_SEC}). Follow/unfollow in the Invo app.`);
-  console.error('  Watch entries: \'[{"baseShortId":"x","mimicStartedAt":"..."}]\'  (optional, polls /dex/trade)');
+  console.error('Every open copy in the copy ledger is polled on /dex/trade automatically.');
+  console.error('  Watch entries: \'[{"baseShortId":"x","mimicStartedAt":"..."}]\'  (optional, extra /dex/trade polling)');
+  console.error('');
+  console.error('Seen posts are saved (MONITOR_STATE_PATH, default data/monitor-state.json), so a restart catches up on');
+  console.error(`posts made while stopped: closes always; opens/updates only if stopped <= --max-catchup seconds (default ${DEFAULT_MAX_CATCHUP_SEC}).`);
+  console.error(`Opens/updates are only emitted if the post's createdAt is <= --max-signal-age seconds old (default ${DEFAULT_MAX_SIGNAL_AGE_SEC}).`);
+  console.error('Closes are only emitted for trades with an open copy in the ledger, once each.');
   console.error('');
   console.error('Modes:');
   console.error('  default:             Run forever, print all signals as JSON lines');
-  console.error('  --wait-for-signal:   Exit after first signal (for agent auto-notify)');
+  console.error('  --wait-for-signal:   Exit after the first poll with a signal (for agent auto-notify)');
   process.exit(1);
+}
+
+function secondsArg(args: string[], name: string, fallback: number, min: number): number {
+  const arg = args.find(a => a.startsWith(`--${name}=`));
+  const value = arg ? Number(arg.slice(name.length + 3)) : fallback;
+  if (!Number.isFinite(value) || value < min) {
+    console.error(`--${name} must be a number of seconds >= ${min}`);
+    usage();
+  }
+  return value;
+}
+
+function print(events: WatchEvent[]) {
+  for (const e of events) (e.stream === 'out' ? console.log : console.error)(JSON.stringify(e.data));
 }
 
 async function main() {
   const args = process.argv.slice(2);
   const waitMode = args.includes('--wait-for-signal');
-  const refreshArg = args.find(a => a.startsWith('--refresh='));
-  const refreshSec = refreshArg ? Number(refreshArg.slice('--refresh='.length)) : DEFAULT_REFRESH_SEC;
-  if (!Number.isFinite(refreshSec) || refreshSec < 10) {
-    console.error('--refresh must be a number of seconds >= 10');
-    usage();
-  }
-  const unknown = args.filter(a => !a.startsWith('[') && a !== '--wait-for-signal' && !a.startsWith('--refresh='));
+  const refreshSec = secondsArg(args, 'refresh', DEFAULT_REFRESH_SEC, 10);
+  const maxCatchUpSec = secondsArg(args, 'max-catchup', DEFAULT_MAX_CATCHUP_SEC, 0);
+  const maxSignalAgeSec = secondsArg(args, 'max-signal-age', DEFAULT_MAX_SIGNAL_AGE_SEC, 10);
+  const flags = ['--wait-for-signal', '--refresh=', '--max-catchup=', '--max-signal-age='];
+  const unknown = args.filter(a => !a.startsWith('[') && !flags.some(f => (f.endsWith('=') ? a.startsWith(f) : a === f)));
   if (unknown.length) usage();
 
   // Watch entries (objects) are still accepted. Portfolio ID arrays (strings) are
   // no longer needed — the followed-trader list is the source of truth.
-  let watchEntries: WatchEntry[] = [];
+  const watchEntries: WatchEntry[] = [];
   let ignoredPortfolioIds = 0;
   for (const arg of args.filter(a => a.startsWith('['))) {
     const arr = JSON.parse(arg);
@@ -58,182 +81,41 @@ async function main() {
       message: `Ignoring ${ignoredPortfolioIds} portfolio ID argument(s) — traders come from your Invo following list`,
     }));
   }
-  const isWatchEntries = watchEntries.length > 0;
 
   // Fails closed: if the following list can't be loaded at startup, exit rather than copy anyone
   const registry = new FollowedTraderRegistry(invo, { refreshIntervalMs: refreshSec * 1000 });
   await registry.refresh();
 
-  const seenPosts = new Set<string>();
-  const seenUpdates = new Set<string>();
-  let pollCount = 0;
-  let isFirstFeedPoll = true;
-
-  const FEED_INTERVAL = 5_000; // 5s for faster signal detection
-
-  const emitFollowing = (type: 'following_loaded' | 'following_changed', extra: object = {}) => {
-    console.log(JSON.stringify({
-      type,
-      count: registry.traders.length,
-      ...extra,
-      traders: registry.traders.map(t => ({
-        userId: t.userId,
-        username: t.username,
-        portfolioIds: t.portfolios.map(p => p.id),
-      })),
-    }));
-  };
-
-  const refreshFollowing = async (onDemand = false) => {
-    try {
-      const diff = onDemand ? await registry.refreshOnDemand() : await registry.refreshIfDue();
-      if (diff && (diff.added.length || diff.removed.length)) {
-        emitFollowing('following_changed', { added: diff.added, removed: diff.removed });
-      }
-    } catch (e: any) {
-      // Keep the last known list; a failed refresh never widens who we copy
-      console.error(JSON.stringify({ type: 'error', source: 'following', message: e.message }));
-    }
-  };
-
-  const poll = async (): Promise<boolean> => {
-    pollCount++;
-    let signalFound = false;
-
-    await refreshFollowing();
-
-    // Poll /dex/trade if we have watch entries
-    if (isWatchEntries) {
-      try {
-        const data = await invo.getTradeUpdates(watchEntries);
-        const items = (data as any).investments ?? (data as any).items ?? [];
-        for (const item of items) {
-          const key = `${item.baseShortId ?? item.id}_${item.lastUpdate ?? ''}`;
-          if (!seenUpdates.has(key)) {
-            seenUpdates.add(key);
-            console.log(JSON.stringify({ type: 'trade_update', poll: pollCount, data: item }));
-            signalFound = true;
-          }
-        }
-      } catch (e: any) {
-        console.error(JSON.stringify({ type: 'error', source: 'trade', message: e.message }));
-      }
-    }
-
-    // Poll feed for trade signals from followed traders
-    try {
-      const data = await invo.getFeed('following', null, 20);
-      const posts = data.items ?? [];
-      for (const post of posts) {
-        if (seenPosts.has(post.id)) continue;
-        seenPosts.add(post.id);
-
-        // Skip first poll results (existing posts, not new signals)
-        if (isFirstFeedPoll) continue;
-
-        let verdict = classifyPost(post, registry.byUserId);
-        if (verdict.kind === 'ignore') continue;
-
-        // Unknown owner or portfolio may mean the list is stale (just followed someone,
-        // or they opened a new portfolio) — re-check against fresh data (rate-limited) before rejecting
-        if (verdict.kind === 'reject' && verdict.ownerId) {
-          if (verdict.reason === 'owner not in following list') {
-            await refreshFollowing(true);
-            verdict = classifyPost(post, registry.byUserId);
-          } else if (verdict.reason === 'portfolio not owned by followed trader') {
-            await registry.refreshPortfolios(verdict.ownerId).catch(() => {});
-            verdict = classifyPost(post, registry.byUserId);
-          }
-        }
-
-        if (verdict.kind !== 'accept') {
-          if (verdict.kind === 'reject') {
-            console.error(JSON.stringify({
-              type: 'skipped',
-              poll: pollCount,
-              postId: post.id,
-              reason: verdict.reason,
-              ownerId: verdict.ownerId ?? null,
-              portfolioId: verdict.portfolioId ?? null,
-            }));
-          }
-          continue;
-        }
-
-        const update = post.update;
-        const isOpen = update.isOpen === true;
-
-        console.log(JSON.stringify({
-          type: 'signal',
-          poll: pollCount,
-          postId: post.id,
-          action: verdict.action,
-          owner: {
-            id: update.owner.id,
-            username: update.owner?.username ?? post.owner?.username,
-          },
-          followed: {
-            userId: verdict.trader.userId,
-            username: verdict.trader.username,
-          },
-          trade: {
-            coin: update.ticker,
-            name: update.name,
-            side: update.directionLong ? 'long' : 'short',
-            leverage: update.leverage,
-            entryPrice: update.entryPrice,
-            closingPrice: update.closingPrice ?? null,
-            entrySize: update.entrySize,
-            isOpen,
-          },
-          portfolio: {
-            id: update.portfolio?.id,
-            title: update.portfolio?.title,
-            winRate: update.portfolio?.winRate,
-            closedPositions: update.portfolio?.closedPositionsCount,
-            openPositions: update.portfolio?.openPositionsCount,
-            pnl: update.portfolio?.plSnapshot,
-          },
-          // Invo's /dex/position/create shape — pass as-is to trade.ts.
-          // sourcePaperTradeBaseShortId is the trader's baseShortId (use it for /dex/trade watch entries)
-          mimicMeta: mimicMetaFromUpdate(update),
-        }));
-        signalFound = true;
-      }
-
-      if (isFirstFeedPoll) {
-        isFirstFeedPoll = false;
-      }
-    } catch (e: any) {
-      console.error(JSON.stringify({ type: 'error', source: 'feed', message: e.message }));
-    }
-
-    return signalFound;
-  };
+  const watcher = new SignalWatcher({
+    invo,
+    registry,
+    ledger: new FileLedgerStore(defaultLedgerPath()),
+    state: new FileStateStore(defaultMonitorStatePath()),
+    watchEntries,
+    maxCatchUpMs: maxCatchUpSec * 1000,
+    maxSignalAgeMs: maxSignalAgeSec * 1000,
+  });
 
   console.log(JSON.stringify({
     type: 'started',
-    mode: isWatchEntries ? 'followed+trade_poll' : 'followed',
     waitForSignal: waitMode,
     watchEntries: watchEntries.length,
     followedTraders: registry.traders.length,
     refreshSec,
+    maxCatchUpSec,
+    maxSignalAgeSec,
   }));
-  emitFollowing('following_loaded');
+  console.log(JSON.stringify({ type: 'following_loaded', ...followingSummary(registry.traders) }));
   if (registry.traders.length === 0) {
-    console.error(JSON.stringify({ type: 'notice', message: 'Your Invo account follows nobody — no signals will be copied until you follow someone' }));
+    console.error(JSON.stringify({ type: 'notice', message: 'Your Invo account follows nobody — no new trades will be copied until you follow someone' }));
   }
 
-  // First poll: index existing posts so we only react to new ones
-  await poll();
-
-  while (true) {
+  // The first poll catches up on what happened while stopped (see signal-watcher.ts)
+  for (;;) {
+    const events = await watcher.poll();
+    print(events);
+    if (waitMode && events.some(e => e.signal)) process.exit(0);
     await new Promise(r => setTimeout(r, FEED_INTERVAL));
-    const found = await poll();
-
-    if (waitMode && found) {
-      process.exit(0);
-    }
   }
 }
 

@@ -236,8 +236,9 @@ test('accepts a verified trade from a followed trader', () => {
   const v = classifyPost(tradePost(), followed);
   assert.equal(v.kind, 'accept');
   if (v.kind === 'accept') {
-    assert.equal(v.trader.userId, 'u1');
-    assert.equal(v.portfolio.id, 'p1');
+    assert.equal(v.trader!.userId, 'u1');
+    assert.equal(v.portfolio!.id, 'p1');
+    assert.equal(v.copied, false);
     assert.equal(v.action, 'open');
   }
 });
@@ -275,17 +276,43 @@ test('ignores non-trade posts', () => {
   assert.deepEqual(classifyPost({ id: 'x', update: { ticker: null } }, followed), { kind: 'ignore' });
 });
 
-test('action rules: open, increase, close', () => {
+test('action rules: only an explicitly new trade is an open; any other change is an ambiguous update', () => {
   const action = (update: any) => {
     const v = classifyPost(tradePost({ update }), followed);
     return v.kind === 'accept' ? v.action : v.kind;
   };
   assert.equal(action({ isOpen: true, changes: { isAdded: true } }), 'open');
-  assert.equal(action({ isOpen: true, changes: { isAdded: false } }), 'increase');
+  // Could be an add, a reduce or an edit — never auto-copied
+  assert.equal(action({ isOpen: true, changes: { isAdded: false } }), 'update');
+  assert.equal(action({ isOpen: true, changes: undefined }), 'update');
+  assert.equal(action({ isOpen: true, changes: {} }), 'update');
+  // Closed without a closing price is still a close, never a possible add
+  assert.equal(action({ isOpen: false, closingPrice: null }), 'close');
+  assert.equal(action({ isOpen: undefined, changes: { isAdded: true } }), 'update');
   assert.equal(action({ isOpen: false, closingPrice: 150 }), 'close');
 });
 
-test('rejects opens and increases missing the trader\'s trade ids', () => {
+test('a close of a trade we copied gets through from someone no longer followed, a repost or an unknown portfolio', () => {
+  const closed = { isOpen: false, closingPrice: 150 };
+  const isCopied = (owner: string, baseId?: string) => owner === 'u9' && baseId === 'base-1';
+  const posts = [
+    tradePost({ post: { owner: { id: 'u9' } }, update: { ...closed, owner: { id: 'u9' } } }), // unfollowed
+    tradePost({ post: { repostId: 'r1', owner: { id: 'u5' } }, update: { ...closed, owner: { id: 'u9' } } }), // repost
+    tradePost({ post: { owner: { id: 'u9' } }, update: { ...closed, owner: { id: 'u9' }, verifiedTrade: false, portfolio: { id: 'p?' } } }),
+  ];
+  for (const post of posts) {
+    const v = classifyPost(post, followed, isCopied);
+    assert.equal(v.kind === 'accept' && v.action === 'close' && v.copied && v.trader, null);
+  }
+  // Not a copied trade (other trade id): still rejected
+  const other = tradePost({ post: { owner: { id: 'u9' } }, update: { ...closed, owner: { id: 'u9' }, baseId: 'base-2' } });
+  assert.equal(classifyPost(other, followed, isCopied).kind, 'reject');
+  // Opens are never let through this way
+  const open = tradePost({ post: { owner: { id: 'u9' } }, update: { owner: { id: 'u9' } } });
+  assert.equal(classifyPost(open, followed, () => true).kind, 'reject');
+});
+
+test('rejects opens and updates missing the trader\'s trade ids', () => {
   for (const changes of [{ isAdded: true }, { isAdded: false }]) {
     const v = classifyPost(tradePost({ update: { changes, baseShortId: undefined } }), followed);
     assert.equal(v.kind === 'reject' && v.reason, 'trade is missing sourcePaperTradeBaseShortId');

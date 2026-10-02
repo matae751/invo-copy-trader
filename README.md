@@ -95,8 +95,8 @@ All commands run via `npx tsx src/commands/<cmd>.ts`.
 | `discover.ts` | Scan & rank top traders | `npx tsx src/commands/discover.ts` |
 | `follow.ts` | Follow/unfollow traders | `npx tsx src/commands/follow.ts follow <userId>` |
 | `monitor.ts` | Real-time signal monitor (your Invo following list) | `npx tsx src/commands/monitor.ts` |
-| `monitor.ts` | Feed + trade polling | `npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"..."}]'` |
-| `monitor.ts` | Wait-for-signal mode | `npx tsx src/commands/monitor.ts --wait-for-signal` |
+| `monitor.ts` | Extra /dex/trade watch entries (open copies are polled automatically) | `npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"..."}]'` |
+| `monitor.ts` | Wait-for-signal mode (resumes from `data/monitor-state.json`; missed opens copied only if stopped ≤ `--max-catchup`, default 300s) | `npx tsx src/commands/monitor.ts --wait-for-signal` |
 | `trade.ts` | Open a position (copy) | `npx tsx src/commands/trade.ts SOL long auto 5 '<signal.mimicMeta JSON>'` |
 | `trade.ts` | Open a position (copies nobody) | `npx tsx src/commands/trade.ts SOL long auto 5 manual` |
 | `close.ts` | Close one trader's copy | `npx tsx src/commands/close.ts SOL '<close signal mimicMeta JSON>'` |
@@ -160,6 +160,9 @@ Signal detected: @trader opened SOL long 8x
          └── When trader closes → close.ts with the close signal's mimicMeta
                 closes only that trader's copy (matched in data/copy-ledger.json);
                 other copies in the same coin stay open. Unmatched → refused.
+                Open copies are also polled on /dex/trade, so a close is seen
+                even after an unfollow. trade/close run one at a time (lock file)
+                and record every order as pending before sending it.
 ```
 
 **Exit strategy: mirror the trader.** We close when they close. No independent TP/SL — the whole point of copy trading is trusting the trader's entries AND exits.
@@ -266,7 +269,7 @@ Composite score: `W/L*20 + WinRate*1.5 + P&L*0.01 + Streak*2 - Losses*0.5`
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| `reduce_only: true` breaks signing | Phantom agent EIP-712 signature recovery fails | Always use `reduce_only: false` |
+| `reduce_only: true` was reported to break signing | Phantom agent EIP-712 signature recovery failed | Unconfirmed: the SDK encodes the flag the same either way and its own `marketClose` uses `true`. Opens use `false`; closes use `true` so they can never flip a position. If a close fails with a signer error, it reports `not_filled` with `orderError` |
 | `grouping: 'normalTpsl'` breaks signing | Multi-order grouping causes wrong signer | Always use `grouping: 'na'` |
 | `"Unknown asset: SOL"` | SDK expects `-PERP` suffix | Use `SOL-PERP`, `BTC-PERP`, etc. (handled in `hl-client.ts`) |
 | `"Price must be divisible by tick size"` | Too many decimal places | Use `toPrecision(5)` on prices (handled in `hl-client.ts`) |

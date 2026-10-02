@@ -9,6 +9,8 @@ export class MemoryLedgerStore implements LedgerStore {
   saves = 0;
   failLoad = false;
   failSave = false;
+  /** Saves fail once this many have succeeded (e.g. 1: the write before the order works, the one after fails). */
+  failSavesAfter = Infinity;
 
   constructor(initial: CopyEntry[] = []) {
     this.entries = structuredClone(initial);
@@ -18,7 +20,7 @@ export class MemoryLedgerStore implements LedgerStore {
     return structuredClone(this.entries);
   }
   save(entries: CopyEntry[]): void {
-    if (this.failSave) throw new Error('disk full');
+    if (this.failSave || this.saves >= this.failSavesAfter) throw new Error('disk full');
     this.saves++;
     this.entries = structuredClone(entries);
   }
@@ -30,13 +32,43 @@ export const UNIVERSE: HlMeta['universe'] = [
   { name: 'SOL', szDecimals: 2, maxLeverage: 20 },
 ];
 
-/** Fake HL: positions are signed coin sizes; orders fill `fillRatio` of their size. */
-export function fakeHl(opts: { positions?: Record<string, number>; mids?: Record<string, number>; fillRatio?: number } = {}) {
+/**
+ * Fake HL: positions are signed coin sizes; orders fill `fillRatio` of their size.
+ * Responses have HL's shape: rejections come back as { status: 'err' } or a
+ * per-order { error }, not as exceptions. A reduce-only order never grows or
+ * flips the position. Orders are kept by cloid for getOrderFill.
+ *   beforeOrder:  change the position between the caller's snapshot and the fill
+ *   orderThrows:  'before' — the request never reaches HL; 'after' — HL fills it,
+ *                 then the response is lost (timeout)
+ *   opaqueOrderResponse: HL fills it but the response has no per-order status
+ *   failPositionsAfterOrder / failOrderLookup: those reads throw
+ *   orderFills:   fills HL already holds for cloids (orders from an earlier run)
+ *   positionLeverage: leverage of positions held at the start (default 5x isolated);
+ *                 setLeverage changes it for the whole coin, as on HL
+ */
+export function fakeHl(opts: {
+  positions?: Record<string, number>;
+  mids?: Record<string, number>;
+  fillRatio?: number;
+  rejectLeverage?: boolean;
+  rejectOrder?: boolean;
+  beforeOrder?: (positions: Record<string, number>) => void;
+  orderThrows?: 'before' | 'after';
+  opaqueOrderResponse?: boolean;
+  failPositionsAfterOrder?: boolean;
+  failOrderLookup?: boolean;
+  orderFills?: Record<string, number>;
+  positionLeverage?: Record<string, { type?: string; value?: number } | undefined>;
+} = {}) {
   const positions: Record<string, number> = { ...opts.positions };
   const mids = { SOL: 100, BTC: 60000, ETH: 3000, ...opts.mids };
   const calls: string[] = [];
-  const orders: { coin: string; isBuy: boolean; size: string; slippagePct: number; midPx: number }[] = [];
+  const orders: { coin: string; isBuy: boolean; size: string; slippagePct: number; midPx: number; reduceOnly: boolean; cloid: string }[] = [];
   const leverage: [string, number][] = [];
+  const fills: Record<string, number> = { ...opts.orderFills };
+  const coinLeverage: Record<string, { type?: string; value?: number } | undefined> = Object.fromEntries(
+    Object.keys(positions).map(coin => [coin, { type: 'isolated', value: 5 }]));
+  Object.assign(coinLeverage, opts.positionLeverage);
 
   const hl: TradeHl & { calls: string[]; orders: typeof orders; leverage: typeof leverage; positions: typeof positions } = {
     calls, orders, leverage, positions,
@@ -45,15 +77,40 @@ export function fakeHl(opts: { positions?: Record<string, number>; mids?: Record
     async getAllMids() { calls.push('getAllMids'); return Object.fromEntries(Object.entries(mids).map(([k, v]) => [k, String(v)])); },
     async getPositions() {
       calls.push('getPositions');
-      return Object.entries(positions).filter(([, v]) => v !== 0).map(([coin, v]) => ({ coin, szi: String(v) }));
+      if (opts.failPositionsAfterOrder && orders.length) throw new Error('clearinghouseState timeout');
+      return Object.entries(positions).filter(([, v]) => v !== 0)
+        .map(([coin, v]) => ({ coin, szi: String(v), ...(coinLeverage[coin] && { leverage: coinLeverage[coin] }) }));
     },
-    async setLeverage(coin, lev) { calls.push('setLeverage'); leverage.push([coin, lev]); },
-    async placeMarketOrder(coin, isBuy, size, slippagePct, midPx) {
+    async getOrderFill(cloid) {
+      calls.push(`getOrderFill:${cloid}`);
+      if (opts.failOrderLookup) throw new Error('orderStatus timeout');
+      return cloid in fills ? { known: true, filledQty: fills[cloid] } : { known: false, filledQty: 0 };
+    },
+    async setLeverage(coin, lev) {
+      calls.push('setLeverage');
+      if (opts.rejectLeverage) return { status: 'err', response: 'Cannot switch leverage type with open position.' };
+      leverage.push([coin, lev]);
+      coinLeverage[coin] = { type: 'isolated', value: lev };
+      return { status: 'ok', response: { type: 'default' } };
+    },
+    async placeMarketOrder(coin, isBuy, size, slippagePct, midPx, reduceOnly, cloid) {
       calls.push('placeMarketOrder');
-      orders.push({ coin, isBuy, size, slippagePct, midPx });
-      const filled = parseFloat(size) * (opts.fillRatio ?? 1);
-      positions[coin] = Number(((positions[coin] ?? 0) + (isBuy ? filled : -filled)).toFixed(8));
-      return { status: 'ok', response: { type: 'order' } };
+      orders.push({ coin, isBuy, size, slippagePct, midPx, reduceOnly, cloid });
+      if (opts.orderThrows === 'before') throw new Error('ECONNRESET');
+      opts.beforeOrder?.(positions);
+      if (opts.rejectOrder) return { status: 'err', response: 'Insufficient margin to place order.' };
+      const pos = positions[coin] ?? 0;
+      let filled = parseFloat(size) * (opts.fillRatio ?? 1);
+      // Reduce-only: only the side that shrinks the position, and no further than flat
+      if (reduceOnly) filled = pos !== 0 && (pos > 0) !== isBuy ? Math.min(filled, Math.abs(pos)) : 0;
+      fills[cloid] = Math.max(0, filled);
+      if (filled > 0) positions[coin] = Number((pos + (isBuy ? filled : -filled)).toFixed(8));
+      if (opts.orderThrows === 'after') throw new Error('request timed out');
+      if (opts.opaqueOrderResponse) return { status: 'ok', response: { type: 'order' } };
+      if (filled <= 0) {
+        return { status: 'ok', response: { type: 'order', data: { statuses: [{ error: 'Order could not immediately match against any resting orders.' }] } } };
+      }
+      return { status: 'ok', response: { type: 'order', data: { statuses: [{ filled: { totalSz: String(filled), avgPx: String(midPx), oid: 1 } }] } } };
     },
   };
   return hl;
@@ -89,10 +146,10 @@ export function fakeInvo(opts: { failRecordOpen?: boolean } = {}) {
 }
 
 /** A signal's mimicMeta for `trader`'s trade `trade` (portfolio p-<trader>). */
-export const signalMeta = (trader: string, trade: string) => ({
+export const signalMeta = (trader: string, trade: string, update = trade) => ({
   portfolioId: `p-${trader}`,
   creatorInvoUserId: trader,
-  initialSourcePaperUpdateId: `upd-${trade}`,
+  initialSourcePaperUpdateId: `upd-${update}`,
   sourcePaperTradeBaseId: `base-${trade}`,
   sourcePaperTradeBaseShortId: `short-${trade}`,
 });
@@ -109,6 +166,7 @@ export function copyEntry(id: string, coin: string, qty: number, trader: string 
       sourcePaperTradeBaseShortId: m.sourcePaperTradeBaseShortId,
     },
     positionRecordIds: [],
+    ...(m && { sourceUpdateIds: [m.initialSourcePaperUpdateId] }),
     status: 'open',
     openedAt: '2026-10-01T00:00:00.000Z',
     updatedAt: '2026-10-01T00:00:00.000Z',

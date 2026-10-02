@@ -158,7 +158,7 @@ This runs **10 automated checks**:
 ║  Min WR to Auto-Copy: 80%        (below this → ask first)           ║
 ║  Copy Opens:          YES        (mirror new positions)              ║
 ║  Copy Closes:         YES        (mirror exits when they close)      ║
-║  Copy Increases:      YES        (mirror position size-ups)          ║
+║  Copy Increases:      ASK        (`update` signals need the user)    ║
 ║  Skip Decreases:      YES        (ignore partial closes)             ║
 ║                                                                      ║
 ║  RISK LIMITS                              mode: MODERATE [2]        ║
@@ -201,7 +201,7 @@ Once confirmed, show:
 ║  Auto-Copy: [ON/OFF] for traders with ≥ [X]% win rate              ║
 ║  Risk Mode: [NAME] — Max [X]x lev | size $40-$78.40 (auto)         ║
 ║  Exit:     Mirror trader closes (no independent TP/SL)              ║
-║  Actions:  Copy opens ✓  closes ✓  increases ✓                     ║
+║  Actions:  Copy opens ✓  closes ✓  increases (ask) ✓               ║
 ║  >> Proceeding to trader discovery...                                ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
@@ -297,7 +297,7 @@ Start the monitor as a **background process**. No trader or portfolio IDs are ne
 cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts
 ```
 
-With watch entries for active mimic positions (feed + trade polling — recommended when you have open positions):
+Every open copy in the copy ledger is polled on `/dex/trade` automatically. Extra watch entries can still be passed:
 ```bash
 cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"..."}]'
 ```
@@ -307,17 +307,26 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
 **How it works:**
 - Loads the following list at startup; **exits with an error if it can't** (never copies anyone unverified)
 - Re-fetches the following list every 60s (`--refresh=<sec>`, min 10), and on demand (rate-limited) when the feed shows an unknown trader or portfolio. Follows/unfollows made in the Invo app take effect on the next refresh or restart. A failed refresh keeps the last list.
-- Polls `POST /dex/trade` every 5 seconds (trade status updates) — only when watch entries provided
-- Polls `POST /v1_0/posts/get_feed` (filter: `following`) every 5 seconds (new signals)
-- A post is a signal only if: `verifiedTrade: true`, not a repost, owner is in the current following list, and the portfolio belongs to that trader
-- Open/increase signals must also carry the trader's trade IDs (`id`, `baseId`, `baseShortId`), or they are skipped with `reason: "trade is missing ..."`. Close signals are passed through either way, but `close.ts` refuses one that doesn't name the trader and their trade.
-- Deduplicates by post ID / update key
+- Polls `POST /dex/trade` every 5 seconds for every open copy in the ledger (plus any watch entries). A watched trade that turns closed becomes a `close` signal (`"source": "trade_poll"`) carrying the copy's IDs from the ledger, so it is caught even after you unfollow the trader (their posts leave the `following` feed). Other `/dex/trade` changes are printed as `trade_update` for information only — they don't end `--wait-for-signal`.
+- Polls `POST /v1_0/posts/get_feed` (filter: `following`) every 5 seconds, paging back to the last post it has seen (up to 5 pages of 20; a `notice` says if a burst was bigger)
+- A post is a signal only if: `verifiedTrade: true`, not a repost, owner is in the current following list, and the portfolio belongs to that trader. **Exception:** a close of a trade we hold a copy of always gets through (`"copied": true`, `followed` may be `null`).
+- `action` is `open` (a new trade: the post says `changes.isAdded: true`), `update` (any other change to an open trade — Invo doesn't say whether it was an add, a reduce or an edit) or `close` (`isOpen: false`).
+- **Opens/updates must be recent:** only emitted if the post's `createdAt` is at most `--max-signal-age` seconds old (default 300). Older ones — e.g. a newly followed trader's earlier posts appearing in the feed — and posts without a readable `createdAt` are `skipped`, never copied.
+- **Every close is remembered for 24h** (in the monitor state), and a close signal is sent for each remembered trade **we hold an open copy of**:
+  - a close seen before our copy was recorded (the trader closed while `trade.ts` was running) is sent as soon as the copy appears in the ledger, and a later open/update of a closed trade is `skipped`;
+  - while the copy stays open (`not_filled`, `partial`, `unknown`, or a passing `refused`), the close is **re-sent every 60s** (`"retry": true`, `"attempt": n`), up to 10 times — including across monitor restarts;
+  - after 10 attempts it sends one `{"type":"close_stuck",...}` instead (stdout, ends `--wait-for-signal`): tell the user that copy needs them.
+  - Closes of trades we hold no copy of are `skipped` (`"close of a trade we hold no copy of — remembered in case one is opened"`). If the ledger can't be read, each newly seen followed-trader close is passed on once.
+- Open/update signals must also carry the trader's trade IDs (`id`, `baseId`, `baseShortId`), or they are skipped with `reason: "trade is missing ..."`. Close signals are passed through either way, but `close.ts` refuses one that doesn't name the trader and their trade.
+- If one poll sees both a close and an open/update of the same trade, only the close is emitted.
+- **Remembers what it has seen** in `data/monitor-state.json` (`MONITOR_STATE_PATH`). On restart it catches up on posts made while it was stopped and marks them `"catchUp": true`: closes always; opens/updates only if it was stopped for at most `--max-catchup` seconds (default 300), otherwise they're `skipped` as too old to copy. The very first run (no state) only indexes the feed.
 - Outputs JSON lines:
   - `{"type":"started",...}` — initial status (stdout)
   - `{"type":"following_loaded","traders":[...]}` — followed traders + portfolio IDs (stdout)
   - `{"type":"following_changed","added":[...],"removed":[...]}` — list changed on Invo (stdout; does NOT end `--wait-for-signal`)
-  - `{"type":"signal",...}` — a followed trader opened/closed/increased a verified trade (stdout)
-  - `{"type":"trade_update",...}` — status update on watched position (stdout)
+  - `{"type":"signal",...}` — a followed trader opened, changed (`update`) or closed a verified trade, or a copied trade closed (stdout)
+  - `{"type":"trade_update",...}` — status update on watched position (stdout, informational)
+  - `{"type":"close_stuck",...}` — a copy is still open after 10 close signals (stdout; needs the user)
   - `{"type":"skipped","reason":...}` — trade post rejected by the filter (stderr)
   - `{"type":"error",...}` — non-fatal error (stderr)
 
@@ -328,6 +337,7 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
   "poll": 42,
   "postId": "uuid",
   "action": "open",
+  "source": "feed",
   "owner": { "id": "uuid", "username": "trader1" },
   "followed": { "userId": "uuid", "username": "trader1" },
   "trade": { "coin": "SOL", "name": "...", "side": "long", "leverage": 5, "entryPrice": 142.5, "closingPrice": null, "entrySize": 2.5, "isOpen": true },
@@ -341,18 +351,15 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
 **Use `--wait-for-signal` mode for efficient, reactive monitoring.** This is the recommended approach — zero polling, zero wasted tokens:
 
 ```bash
-# Feed only (no open positions)
+# Feed + /dex/trade polling of every open copy (automatic)
 cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal
-
-# Feed + trade polling (when you have open positions to watch)
-cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal '[{"baseShortId":"x","mimicStartedAt":"..."}]'
 ```
 
 **How it works:**
 1. Launch via Bash with `run_in_background: true`
 2. The monitor polls the Invo API internally (feed every 5s, trades every 5s)
-3. It skips existing posts on startup (only reacts to NEW signals)
-4. **When a new signal arrives, it prints the signal JSON and exits**
+3. It picks up from where the last run stopped (see `catchUp` above), so signals posted while you were handling the previous one are not lost
+4. **When a poll finds signals, it prints them all and exits** — handle every signal in the output, not just the first
 5. Claude gets auto-notified that the background process completed
 6. Claude reads the output, evaluates the signal, acts on it
 7. Claude relaunches the monitor for the next signal
@@ -360,11 +367,12 @@ cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal '[{"b
 **This is event-driven, not polling.** The agent is idle between signals (no token burn). The Node.js process does the polling server-side for free.
 
 **When notified of a signal:**
-1. Parse the signal JSON from the process output
-2. Evaluate against the locked-in criteria (risk mode, max leverage, auto-copy threshold)
-3. If auto-copy is ON and trader meets the WR threshold → execute the trade automatically via `trade.ts`
-4. If below threshold → present the SIGNAL DETECTED panel and ask the user
-5. **Relaunch the monitor** for the next signal
+1. Parse every signal JSON line from the process output
+2. `close` → run `close.ts <coin> '<mimicMeta>'` (no evaluation needed: it only closes a matching copy). If it doesn't close the copy, just relaunch the monitor: it re-sends the close every 60s while the copy is open. `close_stuck` → tell the user which copy is stuck and why (`close.ts` output); don't loop on it
+3. `open` → evaluate against the locked-in criteria (risk mode, max leverage, auto-copy threshold). If auto-copy is ON and the trader meets the WR threshold → `trade.ts` automatically; otherwise present the SIGNAL DETECTED panel and ask the user
+4. `update` → **never auto-copy.** It may be an add, a partial close or an edit, and copying a reduce as an add grows our position. Show the panel (with `trade.entrySize`) and ask the user. Only if they confirm the trader added to the position, run `trade.ts` with the signal's `mimicMeta` (it sizes it as an increase)
+5. `catchUp: true` → the post was made while the monitor was stopped; say so, and treat an open as staler than usual
+6. **Relaunch the monitor** for the next signal
 
 **Alternative: continuous mode** (without `--wait-for-signal`) runs forever and prints all signals. Use this if you want to `tail` a log file manually:
 ```bash
@@ -414,24 +422,28 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
     - STRONG ($78.40): win streak ≥ 10, win rate ≥ 85%, W/L ≥ 5
     - AVERAGE ($60 if streak 5-9, else $50)
     - POOR ($40): stats unavailable, P&L ≤ 0, liquidated, streak 0, win rate < 60%, or W/L < 1.5
-  - **Increase** (open position in the same direction): the tier amount, capped at 80% of the position's current USD notional. Applies to every increase, with no cap on total position size — always copy increases.
+  - **Increase** (open position in the same direction): the tier amount, capped at 80% of the position's current USD notional. No cap on total position size. Only run an increase for an `update` signal the user confirmed was an add (see "When notified of a signal").
   - A position in the opposite direction makes `trade.ts` refuse the trade.
   - USD is converted to coin units with the current mid price and the asset's szDecimals.
   - All limits hold at the **worst-case fill**, not just at mid: the order is an IOC limit at mid ± 2%, so size is chosen so any fill in that range stays within $40-$78.40 (initial) or under the 80% cap (increase). E.g. at mid $100 the initial size is at most 0.76 coins (≤ $77.52 even at a $102 fill).
 - `leverage`: **required**, a whole number from 1 up to the asset's Hyperliquid max (SOL: 20x, BTC: 40x). `trade.ts` refuses anything else, including a value above that max, before setting leverage or placing an order.
+  - **Leverage is per coin on Hyperliquid** — one value for the whole position, other copies included. When we already hold the coin, the leverage must equal the existing position's (isolated); otherwise `trade.ts` refuses before changing anything: `Refusing 20x on SOL: the existing SOL position is 3x isolated … Re-run with 3`. Re-run at the existing leverage only if the user agrees. A cross position, or one whose leverage can't be read, is refused the same way.
 - `mimicMetaJson`: **required.** Pass the signal's `mimicMeta` unchanged. `trade.ts` checks it before placing any order. It refuses if the argument is missing, is not JSON, has a missing field, or uses the old `{baseId, baseShortId}` shape. It never makes up IDs.
   - Only when the user explicitly asks for a trade that copies nobody, pass the literal `manual` instead. Invo gets no `mimicMeta` (as the Invo app does for its own trades), and size falls to the poor tier ($40). Never use `manual` for a signal.
 
 **What happens under the hood:**
+0. Takes the ledger lock (`data/copy-ledger.json.lock`): only one `trade.ts`/`close.ts` runs at a time; another waits up to 60s, then fails with "another trade/close is running". The holder renews a heartbeat while it runs; a lock is only taken over if its process is dead or its heartbeat stopped for 60s. Every Invo/Hyperliquid request times out after 20s
 1. Connects HL SDK with agent key (phantom agent signing)
 2. Looks up asset index from HL meta (SOL=5, BTC=0, ETH=1, XRP=25, DOGE=12)
+   - An order an earlier run placed in this coin but never recorded (it crashed or lost the response) is settled first by looking it up on HL by client order id (`settledPendingOrders` in the output). If it can't be looked up, `trade.ts` stops: nothing in that coin is traded until it is settled
 3. Snapshots position before, fetches the mid price and the trader's stats, and computes the size (initial or increase)
-4. Sets leverage via `sdk.exchange.updateLeverage(coin, 'isolated', leverage)`
-5. Places IOC limit order with 2% slippage + builder fee (0.35% to `0x557e...`)
+   - Ledger entries in that coin that the live position shows are gone (position flat, or on the other side: liquidated, TP/SL, closed elsewhere) are marked closed first (`reconciledEntryIds` in the output)
+4. Sets leverage via `sdk.exchange.updateLeverage(coin, 'isolated', leverage)`. If Hyperliquid rejects it (e.g. an open cross position in that coin), `trade.ts` stops with an error and **no order is placed**
+5. Writes the order to the ledger as pending (with a client order id, `cloid`), then places an IOC limit order with 2% slippage + builder fee (0.35% to `0x557e...`)
    - Uses `grouping: 'na'` (normalTpsl breaks agent signing)
-   - Uses `reduce_only: false` (true breaks phantom agent signature recovery)
-6. Snapshots position after
-7. Records on Invo via `POST /dex/position/create` with full payload:
+   - Uses `reduce_only: false` (opens add to the position; closes use `true`)
+6. Takes the fill from the order's own response (or, if that's lost, looks the order up by `cloid`), so other activity in the coin is never counted as this copy. Snapshots the position after
+7. If anything filled, records on Invo via `POST /dex/position/create` with full payload:
    - `mimicMeta` from the signal (portfolioId, creatorInvoUserId, initialSourcePaperUpdateId, sourcePaperTradeBaseId, sourcePaperTradeBaseShortId)
    - `submission` (hlOrder + hlResponse + nonceMs)
    - `summary` (qtyBefore, qtyAfter, intendedLeverage)
@@ -470,7 +482,11 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
 }
 ```
 
-**Save `sourceBaseShortId`** (the trader's `baseShortId`). Use it in `/dex/trade` watch entries for this position. To close, pass the **close signal's** `mimicMeta` to `close.ts`. The ledger entry `trade.ts` recorded (`ledger.entryId`) is what it matches against.
+`status` is `filled`, `not_filled` (nothing filled, including an order Hyperliquid rejected; `orderError` gives the reason) or `unknown` (the order was sent but neither its response nor HL says what filled). On `not_filled` nothing is recorded on Invo or in the ledger. `unknown` includes a failed order request (timeout, connection error) that HL has no record of yet: it may still arrive, so it isn't counted as unfilled. On `unknown`, or a ledger write failure after a fill, the order stays pending in the ledger and the next `trade.ts`/`close.ts` in that coin settles it (an order HL still doesn't know a minute after it was sent is settled as never sent; until then that coin is refused with "may still arrive — try again in Ns") — tell the user, and don't retry the signal blindly (a retry of the same update is refused once settled anyway). The exit code is non-zero for anything but a recorded fill.
+
+**Each trader update is copied once.** The ledger records every `mimicMeta.initialSourcePaperUpdateId` it copied. Passing the same one again (a repeated signal, a retry after a fill) is refused before Hyperliquid is touched, even after that copy closed. An update that didn't fill can be retried.
+
+**Save `sourceBaseShortId`** (the trader's `baseShortId`). The monitor polls it on `/dex/trade` automatically while the copy is open. To close, pass the **close signal's** `mimicMeta` to `close.ts`. The ledger entry `trade.ts` recorded (`ledger.entryId`) is what it matches against.
 
 **Show execution panel:**
 ```
@@ -513,17 +529,18 @@ cd ~/invo-copy-trader && npx tsx src/commands/close.ts <coin> '<close signal mim
 
 **How a close is matched:** every fill `trade.ts` makes is recorded in the copy ledger (`data/copy-ledger.json`) against the trader and trade it copied. Hyperliquid nets all fills in a coin into one position, so the ledger is the only record of whose part is whose. A close signal:
 1. Must name a trader and at least one of their trade IDs, otherwise it is **refused**.
-2. Must match exactly one open ledger entry with the same coin, trader and trade, otherwise it is **refused**. Another trader's close on the same coin never matches. A manual trade is never closed by a signal.
-3. Closes **only that copy's quantity** (opposite-direction IOC, rounded down to the lot size). Other copies in the coin stay open.
+2. Must match exactly one open ledger entry with the same coin, trader and trade, otherwise it is **refused**. The trade is identified by `sourcePaperTradeBaseId` when the signal has one (a differing `sourcePaperTradeBaseShortId` doesn't block it); by `sourcePaperTradeBaseShortId` only when it has no `baseId`. Another trader's close on the same coin never matches. A manual trade is never closed by a signal.
+3. Closes **only that copy's quantity** (opposite-direction **reduce-only** IOC, rounded down to the lot size). Other copies in the coin stay open. Reduce-only means that if the position shrank since the snapshot, the order can't flip it into a new position.
 
-It is also **refused**, with no order, if:
-- there is no HL position;
-- the position is in the other direction;
-- the position is smaller than the copies tracked in it (something reduced it outside the ledger; you can't tell whose part is gone).
+If the HL position is flat, or on the other side of the copy, the copy is already gone (liquidated, TP/SL, closed elsewhere). No order is placed: the stale ledger entries in that coin are marked closed and `status` is `already_closed`. Other entries on the wrong side of the live position are reconciled the same way before a close.
+
+It is **refused**, with no order, if the position is on the copy's side but smaller than the copies tracked in it (something reduced it outside the ledger; you can't tell whose part is gone). Close with `manual` only if the user asks.
 
 Every refusal before the position check happens without touching Hyperliquid.
 
-**Output:** `status` is `closed`, `partial` (IOC partly filled; the ledger keeps the rest open), `not_filled` or `refused` (with a `reason`). It also includes `entryId`, `trader`, `requestedQty`, `closedQty` and `copyQtyLeft`. The exit code is non-zero for `refused`, `not_filled`, or a ledger write failure.
+Like `trade.ts`, it takes the ledger lock, settles any unrecorded order in the coin first, writes the close order to the ledger as pending before sending it, and takes the fill from the order itself (or by `cloid`). A retry after a lost response finds the earlier order already closed the copy and returns `already_closed` without a second order.
+
+**Output:** `status` is `closed`, `partial` (IOC partly filled; the ledger keeps the rest open), `not_filled` (with `orderError` when Hyperliquid rejected the order), `already_closed`, `unknown` (fill unknown — the order stays pending and the next trade/close in the coin settles it) or `refused` (with a `reason`). It also includes `entryId`, `trader`, `requestedQty`, `closedQty`, `copyQtyLeft`, `cloid` and, when relevant, `reconciledEntryIds` / `settledPendingOrders`. The exit code is non-zero for `refused`, `not_filled`, `unknown`, or a ledger write failure.
 
 Invo isn't called. It auto-detects HL closes. `/dex/position/close` needs your own position's `baseShortId`, which `/dex/position/create` never returns.
 
@@ -578,7 +595,7 @@ Keep track of open positions mentally:
 - Which coin, direction, size, leverage
 - **Trader's `baseShortId`** (`sourceBaseShortId` from `trade.ts` output, `= signal.mimicMeta.sourcePaperTradeBaseShortId`), needed for `/dex/trade` polling
 - `positionRecordId` from `trade.ts` output (Invo's record of your copy)
-- `ledger.entryId` from `trade.ts` output. The copy ledger (`data/copy-ledger.json`) is what `close.ts` matches close signals against. If `ledger.error` is set after a fill, tell the user: that copy can't be closed by a signal.
+- `ledger.entryId` from `trade.ts` output. The copy ledger (`data/copy-ledger.json`) is what `close.ts` matches close signals against. If `ledger.error` is set after a fill (or `status` is `unknown`), tell the user: the order is pending in the ledger and is settled by the next trade/close in that coin.
 - Entry price (from trade output)
 - Which trader you copied
 
