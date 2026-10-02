@@ -436,9 +436,10 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
 1. Connects HL SDK with agent key (phantom agent signing)
 2. Looks up asset index from HL meta (SOL=5, BTC=0, ETH=1, XRP=25, DOGE=12)
    - An order an earlier run placed in this coin but never recorded (it crashed or lost the response) is settled first by looking it up on HL by client order id (`settledPendingOrders` in the output). If it can't be looked up, `trade.ts` stops: nothing in that coin is traded until it is settled
-3. Snapshots position before, fetches the mid price and the trader's stats, and computes the size (initial or increase)
+3. Snapshots position before and fetches the trader's stats
    - Ledger entries in that coin that the live position shows are gone (position flat, or on the other side: liquidated, TP/SL, closed elsewhere) are marked closed first (`reconciledEntryIds` in the output)
 4. Sets leverage via `sdk.exchange.updateLeverage(coin, 'isolated', leverage)`. If Hyperliquid rejects it (e.g. an open cross position in that coin), `trade.ts` stops with an error and **no order is placed**
+   - Then fetches the mid price and computes the size (initial or increase). The price is fetched last, after the slow network steps, so the size and limit price match the price the order is sent at
 5. Writes the order to the ledger as pending (with a client order id, `cloid`), then places an IOC limit order with 2% slippage + builder fee (0.35% to `0x557e...`)
    - Uses `grouping: 'na'` (normalTpsl breaks agent signing)
    - Uses `reduce_only: false` (opens add to the position; closes use `true`)
@@ -602,7 +603,7 @@ Keep track of open positions mentally:
 ### Error Recovery
 
 - **"Unknown asset: SOL"**: The HL SDK (v1.7.7) requires `-PERP` suffix (e.g., `SOL-PERP`). The `hl-client.ts` `toSdkCoin()` helper handles this. The REST API uses raw names (`SOL`).
-- **"Price must be divisible by tick size"**: Limit price has too many significant figures. Use `toPrecision(5)` not `toPrecision(6)`.
+- **"Price must be divisible by tick size"**: shouldn't happen — `limitPrice` in `src/sizing.ts` already keeps prices to HL's rule (≤ 5 significant figures and ≤ `6 − szDecimals` decimals). If it does, report it; don't hand-edit prices or retry with a different price.
 - **`/dex/trade` 404**: You're polling with the wrong `baseShortId`. Use the **trader's** `baseShortId` from `signal.mimicMeta.sourcePaperTradeBaseShortId`.
 - **"Order has invalid size"**: Wrong szDecimals. SOL=2, BTC=5, ETH=4, XRP=0, DOGE=0.
 - **"No mid price for X"**: Asset not on HL. Check the coin name matches HL universe exactly.
@@ -666,7 +667,7 @@ The `hyperliquid` npm SDK (v1.7.7) handles all exchange operations:
 
 **CRITICAL — SDK coin name format:** The SDK uses its own `SymbolConversion` layer that expects `SOL-PERP` format, NOT the raw `SOL` that the REST API uses. The `hl-client.ts` helper `toSdkCoin()` auto-appends `-PERP` for `updateLeverage` and `placeOrder`. The REST API (`/info` endpoint for `meta`, `allMids`, `clearinghouseState`) still uses raw names like `SOL`.
 
-**CRITICAL — Price tick size:** HL requires limit prices with max 5 significant figures. The `placeMarketOrder` function uses `toPrecision(5)` on the slippage-adjusted price. Using `toPrecision(6)` or more causes `"Price must be divisible by tick size"` errors.
+**CRITICAL — Price tick size:** HL requires perp limit prices with at most 5 significant figures **and** at most `6 − szDecimals` decimal places (e.g. 0.55407 is rejected when szDecimals is 2). `limitPrice` in `src/sizing.ts` applies both, rounding away from mid, and `placeMarketOrder` takes the asset's `szDecimals` for it. Breaking either rule causes `"Price must be divisible by tick size"` errors.
 
 **Builder fee**: `{address: '0x557edb253b1d7ed5f15b248a5a3fd919fa5d3c81', fee: 35}` (0.35%) — REQUIRED on all orders for Invo compatibility.
 

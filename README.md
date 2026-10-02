@@ -272,7 +272,7 @@ Composite score: `W/L*20 + WinRate*1.5 + P&L*0.01 + Streak*2 - Losses*0.5`
 | `reduce_only: true` was reported to break signing | Phantom agent EIP-712 signature recovery failed | Unconfirmed: the SDK encodes the flag the same either way and its own `marketClose` uses `true`. Opens use `false`; closes use `true` so they can never flip a position. If a close fails with a signer error, it reports `not_filled` with `orderError` |
 | `grouping: 'normalTpsl'` breaks signing | Multi-order grouping causes wrong signer | Always use `grouping: 'na'` |
 | `"Unknown asset: SOL"` | SDK expects `-PERP` suffix | Use `SOL-PERP`, `BTC-PERP`, etc. (handled in `hl-client.ts`) |
-| `"Price must be divisible by tick size"` | Too many decimal places | Use `toPrecision(5)` on prices (handled in `hl-client.ts`) |
+| `"Price must be divisible by tick size"` | More than 5 significant figures, or more than `6 − szDecimals` decimals | Both limits applied by `limitPrice` in `sizing.ts` (rounded away from mid) |
 | `"Order has invalid size"` | Wrong szDecimals for the asset | Check asset table above |
 | `"Order price cannot be more than 95% away"` | Position too large for available margin | Reduce size |
 | `/dex/trade` returns 404 | Polling with a `baseShortId` that isn't the trader's | Use `signal.mimicMeta.sourcePaperTradeBaseShortId` (= `trade.ts` `sourceBaseShortId`) |

@@ -157,9 +157,6 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   const copiedAfterSettle = updateId ? findCopiedUpdate(ledgerEntries, updateId) : undefined;
   if (copiedAfterSettle) refuseRepeat(copiedAfterSettle, updateId!);
 
-  const mid = parseFloat((await hl.getAllMids())[coin]);
-  if (!mid) throw new Error(`No mid price for ${coin}`);
-
   // Snapshot position before
   const posBefore = await hl.getPositions();
   const existing = posBefore.find(p => p.coin === coin);
@@ -179,21 +176,29 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   }
   if (existingSzi !== 0) checkExistingLeverage(coin, existing!, leverage);
 
-  // Size: initial copy → $40-$78.40 by tier; increase → tier target capped at 80% of current notional.
-  // Bounds hold at the worst-case fill (mid ± SLIPPAGE_PCT), not just at mid.
-  // Stats null on any lookup failure → poor tier ($40)
+  // Trader's tier. Stats null on any lookup failure → poor tier ($40)
   const statsLookup = await getTraderStats(invo, mimicMetaArg);
   const perf = classifyTrader(statsLookup.stats);
+
+  // Set leverage. HL reports a rejection (e.g. can't switch an open cross position to
+  // isolated) in the response body; never place the order at a leverage we didn't set.
+  // (With a position open, checkExistingLeverage above means this changes nothing.)
+  assertHlOk(await hl.setLeverage(coin, leverage), `Setting ${coin} to ${leverage}x isolated`);
+
+  // Price last: the stats lookup and leverage change above are network calls (up to 20s
+  // each), and the order's size and limit must come from the price it's sent at. Only a
+  // local ledger write sits between this and the order.
+  const mid = parseFloat((await hl.getAllMids())[coin]);
+  if (!mid) throw new Error(`No mid price for ${coin}`);
+
+  // Size: initial copy → $40-$78.40 by tier; increase → tier target capped at 80% of current notional.
+  // Bounds hold at the worst-case fill (mid ± SLIPPAGE_PCT), not just at mid.
   const isIncrease = existingSzi !== 0;
   const currentNotionalUsd = Math.abs(existingSzi) * mid;
   const sizing = isIncrease
     ? sizeIncrease(perf.notionalUsd, currentNotionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT)
     : sizeInitial(perf.notionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT);
   const sizeStr = sizing.qty;
-
-  // Set leverage. HL reports a rejection (e.g. can't switch an open cross position to
-  // isolated) in the response body; never place the order at a leverage we didn't set.
-  assertHlOk(await hl.setLeverage(coin, leverage), `Setting ${coin} to ${leverage}x isolated`);
 
   const clientTxId = newId();
   const cloid = newCloid();

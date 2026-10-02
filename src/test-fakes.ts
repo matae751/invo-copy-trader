@@ -70,8 +70,8 @@ export function fakeHl(opts: {
     Object.keys(positions).map(coin => [coin, { type: 'isolated', value: 5 }]));
   Object.assign(coinLeverage, opts.positionLeverage);
 
-  const hl: TradeHl & { calls: string[]; orders: typeof orders; leverage: typeof leverage; positions: typeof positions } = {
-    calls, orders, leverage, positions,
+  const hl: TradeHl & { calls: string[]; orders: typeof orders; leverage: typeof leverage; positions: typeof positions; mids: typeof mids } = {
+    calls, orders, leverage, positions, mids,
     async connect() { calls.push('connect'); },
     async getMeta() { calls.push('getMeta'); return { universe: UNIVERSE }; },
     async getAllMids() { calls.push('getAllMids'); return Object.fromEntries(Object.entries(mids).map(([k, v]) => [k, String(v)])); },

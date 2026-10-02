@@ -10,7 +10,9 @@
 // land within [mid × (1 - s), mid × (1 + s)]:
 //   - buy max / sell min:  bounded by the order's own limit price (hard guarantee)
 //   - buy min / sell max:  assumes price doesn't move > s between the mid fetch
-//                          and the fill (milliseconds) — a limit order can't bound it
+//                          and the fill — a limit order can't bound it. trade-exec
+//                          fetches mid last, just before sizing and sending the
+//                          order, so that gap is one order round trip
 
 export const MIN_INITIAL_NOTIONAL_USD = 40;
 export const MAX_INITIAL_NOTIONAL_USD = 78.4;

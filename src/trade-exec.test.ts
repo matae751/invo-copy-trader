@@ -109,6 +109,25 @@ test('adding at the existing leverage works; a new position sets its own', async
   await assert.rejects(fresh.trade(['ETH', 'long', 'auto', '5', meta('dave', 't4')]), /existing ETH position is 10x isolated/);
 });
 
+// --- Price freshness ---
+
+test('size and limit come from the price fetched after the slow steps, so a short stays within $78.40', async () => {
+  const { hl, invo, trade } = setup();
+  // The price rises 10% while the Invo stats lookup is in flight
+  const lookup = invo.getPortfolioById.bind(invo);
+  invo.getPortfolioById = async (id: string) => { hl.mids.SOL = 110; return lookup(id); };
+
+  const out = await trade(['SOL', 'short', 'auto', '5', meta('alice', 't1')]);
+  assert.equal(out.status, 'filled');
+  assert.equal(hl.orders[0].midPx, 110);
+  assert.equal(out.sizing.mid, 110);
+  // Sized at the old $100 it would be 0.76 SOL: $85.27 at a $112.20 fill
+  assert.ok(parseFloat(out.size) * 110 * 1.02 <= 78.4 + 1e-9, `${out.size} SOL at up to $112.20`);
+  // Price fetched after the stats lookup and the leverage change, right before the order
+  const at = (c: string) => hl.calls.lastIndexOf(c);
+  assert.ok(at('setLeverage') < at('getAllMids') && at('getAllMids') < at('placeMarketOrder'), hl.calls.join(' '));
+});
+
 // --- Trader (copy) path ---
 
 test('copying a trader sends their mimicMeta, sizes from their stats and records the copy in the ledger', async () => {
