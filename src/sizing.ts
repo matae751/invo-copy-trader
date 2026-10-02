@@ -1,9 +1,18 @@
 // Copy-trade position sizing. Pure functions — no network or env access.
 //
-// Initial copy:  USD notional in [$40, $78.40], picked by the copied trader's
-//                performance tier.
-// Increase:      the tier notional, capped at 80% of the current USD notional
-//                of our position (valued at mid). No cap on total position size.
+// Sizes follow the account: percentages of the current Hyperliquid account
+// equity (marginSummary.accountValue), read fresh before each copy.
+//
+// Initial copy:  USD notional between 5% and 10% of equity (copyRange). The
+//                copied trader's performance tier picks the percentage: poor 5%,
+//                average 6.4% (streak < 5) or 7.7% (streak >= 5), strong 10%.
+//                The floor is never below Hyperliquid's $10 minimum order, so
+//                under $200 of equity it is $10 rather than 5%; under $100 the
+//                account is too small to copy at all.
+// Increase:      the tier's % of equity (at most 10%), capped at 80% of the
+//                current USD notional of our position (valued at mid). No 5%
+//                floor (the 80% cap can be smaller); $10 minimum. No cap on
+//                total position size.
 //
 // All limits are enforced at the worst-case fill price, not at mid. Orders are
 // IOC limits at mid ± SLIPPAGE_PCT (see limitPrice), so fills are assumed to
@@ -14,8 +23,16 @@
 //                          fetches mid last, just before sizing and sending the
 //                          order, so that gap is one order round trip
 
-export const MIN_INITIAL_NOTIONAL_USD = 40;
-export const MAX_INITIAL_NOTIONAL_USD = 78.4;
+/** A copy's size range, as % of account equity. */
+export const MIN_EQUITY_PCT = 5;
+export const MAX_EQUITY_PCT = 10;
+/** % of equity each tier aims for, within [MIN_EQUITY_PCT, MAX_EQUITY_PCT]. */
+export const TIER_EQUITY_PCT = {
+  poor: 5,
+  averageShortStreak: 6.4, // streak < 5
+  averageLongStreak: 7.7, // streak >= 5
+  strong: 10,
+} as const;
 export const MAX_INCREASE_FRACTION = 0.8;
 export const MIN_ORDER_NOTIONAL_USD = 10; // Hyperliquid minimum order value
 export const SLIPPAGE_PCT = 0.02;
@@ -36,12 +53,13 @@ export type Tier = 'strong' | 'average' | 'poor';
 
 export interface TierResult {
   tier: Tier;
-  notionalUsd: number;
+  /** % of account equity this tier aims for. */
+  equityPct: number;
   reasons: string[];
 }
 
 export function classifyTrader(stats: TraderStats | null | undefined): TierResult {
-  if (!stats) return { tier: 'poor', notionalUsd: 40, reasons: ['trader stats unavailable'] };
+  if (!stats) return { tier: 'poor', equityPct: TIER_EQUITY_PCT.poor, reasons: ['trader stats unavailable'] };
 
   const winRate = stats.winRate;
   const streak = stats.currentWinStreak;
@@ -60,14 +78,44 @@ export function classifyTrader(stats: TraderStats | null | undefined): TierResul
   if (streak === 0) poor.push('last closed trade lost');
   if (winRate != null && winRate < 60) poor.push('win rate < 60%');
   if (wl < 1.5) poor.push('W/L < 1.5');
-  if (poor.length) return { tier: 'poor', notionalUsd: 40, reasons: [...poor, summary] };
+  if (poor.length) return { tier: 'poor', equityPct: TIER_EQUITY_PCT.poor, reasons: [...poor, summary] };
 
   if (streak! >= 10 && winRate! >= 85 && wl >= 5) {
-    return { tier: 'strong', notionalUsd: MAX_INITIAL_NOTIONAL_USD, reasons: [summary] };
+    return { tier: 'strong', equityPct: TIER_EQUITY_PCT.strong, reasons: [summary] };
   }
 
-  return { tier: 'average', notionalUsd: streak! >= 5 ? 60 : 50, reasons: [summary] };
+  return {
+    tier: 'average',
+    equityPct: streak! >= 5 ? TIER_EQUITY_PCT.averageLongStreak : TIER_EQUITY_PCT.averageShortStreak,
+    reasons: [summary],
+  };
 }
+
+/** USD bounds for a new copy, from the account's equity. */
+export interface CopyRange {
+  equityUsd: number;
+  /** 5% of equity, or Hyperliquid's $10 minimum order if that is more. */
+  minUsd: number;
+  /** 10% of equity. */
+  maxUsd: number;
+}
+
+/** Throws if equity is unusable, or too small for a copy (10% below the $10 minimum order). */
+export function copyRange(equityUsd: number): CopyRange {
+  if (!Number.isFinite(equityUsd) || !(equityUsd > 0)) throw new Error(`Invalid account equity: ${equityUsd}`);
+  const maxUsd = (equityUsd * MAX_EQUITY_PCT) / 100;
+  const minUsd = Math.max((equityUsd * MIN_EQUITY_PCT) / 100, MIN_ORDER_NOTIONAL_USD);
+  if (minUsd > maxUsd) {
+    throw new Error(
+      `Account equity $${equityUsd.toFixed(2)} is too small to copy: ${MAX_EQUITY_PCT}% ($${maxUsd.toFixed(2)}) ` +
+      `is below Hyperliquid's $${MIN_ORDER_NOTIONAL_USD} minimum order`,
+    );
+  }
+  return { equityUsd, minUsd, maxUsd };
+}
+
+/** The tier's percentage of equity in USD (clamped by sizeInitial, capped by sizeIncrease). */
+export const tierTargetUsd = (equityUsd: number, equityPct: number) => (equityUsd * equityPct) / 100;
 
 function floorQty(qty: number, szDecimals: number): number {
   const f = 10 ** szDecimals;
@@ -142,11 +190,12 @@ function assertPrice(mid: number, szDecimals: number) {
 }
 
 /**
- * Size a new copied position. Any fill in the assumed range lands within
- * [$40, $78.40], or this throws.
+ * Size a new copied position: targetUsd clamped to [range.minUsd, range.maxUsd].
+ * Any fill in the assumed price range lands within that band, or this throws.
  */
 export function sizeInitial(
   targetUsd: number,
+  range: Pick<CopyRange, 'minUsd' | 'maxUsd'>,
   mid: number,
   szDecimals: number,
   isBuy: boolean,
@@ -154,15 +203,17 @@ export function sizeInitial(
 ): SizeResult {
   assertPrice(mid, szDecimals);
   const px = fillPriceRange(mid, isBuy, szDecimals, slippagePct);
-  const lo = ceilQty(MIN_INITIAL_NOTIONAL_USD / px.lowPx, szDecimals);
-  const hi = floorQty(MAX_INITIAL_NOTIONAL_USD / px.highPx, szDecimals);
+  const { minUsd, maxUsd } = range;
+  if (!(minUsd > 0) || !(maxUsd >= minUsd)) throw new Error(`Invalid size range: $${minUsd}-$${maxUsd}`);
+  const lo = ceilQty(minUsd / px.lowPx, szDecimals);
+  const hi = floorQty(maxUsd / px.highPx, szDecimals);
   if (lo > hi || hi <= 0) {
     throw new Error(
-      `Cannot size within $${MIN_INITIAL_NOTIONAL_USD}-$${MAX_INITIAL_NOTIONAL_USD} at worst-case fill: ` +
+      `Cannot size within $${minUsd.toFixed(2)}-$${maxUsd.toFixed(2)} at worst-case fill: ` +
       `one size step (${10 ** -szDecimals} @ $${mid}, ±${slippagePct * 100}%) is too coarse`,
     );
   }
-  const target = Math.min(Math.max(targetUsd, MIN_INITIAL_NOTIONAL_USD), MAX_INITIAL_NOTIONAL_USD);
+  const target = Math.min(Math.max(targetUsd, minUsd), maxUsd);
   const qty = Math.min(Math.max(roundQty(target / mid, szDecimals), lo), hi);
   return result(qty, mid, szDecimals, px);
 }
@@ -173,7 +224,8 @@ export interface IncreaseResult extends SizeResult {
 
 /**
  * Size an add to an existing position: min(targetUsd, 80% of current notional),
- * with the worst-case fill held under that amount. Rounded down.
+ * with the worst-case fill held under that amount. Rounded down. targetUsd is the
+ * tier's % of equity, at most 10% of it (see trade-exec).
  */
 export function sizeIncrease(
   targetUsd: number,

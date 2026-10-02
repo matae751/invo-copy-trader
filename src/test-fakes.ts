@@ -45,6 +45,8 @@ export const UNIVERSE: HlMeta['universe'] = [
  *   orderFills:   fills HL already holds for cloids (orders from an earlier run)
  *   positionLeverage: leverage of positions held at the start (default 5x isolated);
  *                 setLeverage changes it for the whole coin, as on HL
+ *   equity:       account equity in USD (default 784: 10% = $78.40, 5% = $39.20);
+ *                 `hl.equity` can be changed mid-test
  */
 export function fakeHl(opts: {
   positions?: Record<string, number>;
@@ -59,6 +61,7 @@ export function fakeHl(opts: {
   failOrderLookup?: boolean;
   orderFills?: Record<string, number>;
   positionLeverage?: Record<string, { type?: string; value?: number } | undefined>;
+  equity?: number;
 } = {}) {
   const positions: Record<string, number> = { ...opts.positions };
   const mids = { SOL: 100, BTC: 60000, ETH: 3000, ...opts.mids };
@@ -70,8 +73,12 @@ export function fakeHl(opts: {
     Object.keys(positions).map(coin => [coin, { type: 'isolated', value: 5 }]));
   Object.assign(coinLeverage, opts.positionLeverage);
 
-  const hl: TradeHl & { calls: string[]; orders: typeof orders; leverage: typeof leverage; positions: typeof positions; mids: typeof mids } = {
+  const hl: TradeHl & {
+    calls: string[]; orders: typeof orders; leverage: typeof leverage; positions: typeof positions; mids: typeof mids; equity: number;
+  } = {
     calls, orders, leverage, positions, mids,
+    equity: opts.equity ?? 784,
+    async getAccountEquity() { calls.push('getAccountEquity'); return this.equity; },
     async connect() { calls.push('connect'); },
     async getMeta() { calls.push('getMeta'); return { universe: UNIVERSE }; },
     async getAllMids() { calls.push('getAllMids'); return Object.fromEntries(Object.entries(mids).map(([k, v]) => [k, String(v)])); },

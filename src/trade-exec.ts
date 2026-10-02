@@ -4,7 +4,7 @@
 
 import { randomBytes, randomUUID } from 'crypto';
 import type { RecordOpenPayload } from './invo-client.js';
-import { classifyTrader, sizeInitial, sizeIncrease, SLIPPAGE_PCT } from './sizing.js';
+import { classifyTrader, copyRange, sizeInitial, sizeIncrease, tierTargetUsd, SLIPPAGE_PCT } from './sizing.js';
 import { getTraderStats, type TraderStatsClient } from './trader-stats.js';
 import { parseMimicMetaArg, MANUAL_TRADE_ARG } from './mimic-meta.js';
 import { parseLeverageArg, checkLeverage } from './leverage.js';
@@ -49,6 +49,8 @@ export interface ExecHl extends OrderLookup {
 
 export interface TradeHl extends ExecHl {
   setLeverage(coin: string, leverage: number): Promise<unknown>;
+  /** The account's current Hyperliquid equity in USD (marginSummary.accountValue). */
+  getAccountEquity(): Promise<number>;
 }
 
 export interface TradeInvo extends TraderStatsClient {
@@ -68,6 +70,8 @@ export class UsageError extends Error {}
 
 export const TRADE_USAGE =
   `Usage: trade <coin> <long|short> <size (ignored — computed from trader performance)> <leverage> <mimicMetaJson | ${MANUAL_TRADE_ARG}>`;
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
 
 export const randomCloid = () => `0x${randomBytes(16).toString('hex')}`;
 
@@ -176,7 +180,7 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   }
   if (existingSzi !== 0) checkExistingLeverage(coin, existing!, leverage);
 
-  // Trader's tier. Stats null on any lookup failure → poor tier ($40)
+  // Trader's tier, as a % of equity. Stats null on any lookup failure → poor tier (5%)
   const statsLookup = await getTraderStats(invo, mimicMetaArg);
   const perf = classifyTrader(statsLookup.stats);
 
@@ -185,19 +189,22 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   // (With a position open, checkExistingLeverage above means this changes nothing.)
   assertHlOk(await hl.setLeverage(coin, leverage), `Setting ${coin} to ${leverage}x isolated`);
 
-  // Price last: the stats lookup and leverage change above are network calls (up to 20s
-  // each), and the order's size and limit must come from the price it's sent at. Only a
-  // local ledger write sits between this and the order.
+  // Equity and price last: the stats lookup and leverage change above are network calls
+  // (up to 20s each), and the size must track the balance and price as they are when the
+  // order goes out. Only a local ledger write sits between these reads and the order.
+  const range = copyRange(await hl.getAccountEquity()); // throws if unusable or too small
   const mid = parseFloat((await hl.getAllMids())[coin]);
   if (!mid) throw new Error(`No mid price for ${coin}`);
 
-  // Size: initial copy → $40-$78.40 by tier; increase → tier target capped at 80% of current notional.
+  // Size: initial copy → the tier's % of equity, clamped to 5–10% of equity;
+  // increase → the tier's % of equity (≤ 10%), capped at 80% of current notional.
   // Bounds hold at the worst-case fill (mid ± SLIPPAGE_PCT), not just at mid.
   const isIncrease = existingSzi !== 0;
   const currentNotionalUsd = Math.abs(existingSzi) * mid;
+  const targetUsd = Math.min(tierTargetUsd(range.equityUsd, perf.equityPct), range.maxUsd);
   const sizing = isIncrease
-    ? sizeIncrease(perf.notionalUsd, currentNotionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT)
-    : sizeInitial(perf.notionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT);
+    ? sizeIncrease(targetUsd, currentNotionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT)
+    : sizeInitial(targetUsd, range, mid, szDecimals, isBuy, SLIPPAGE_PCT);
   const sizeStr = sizing.qty;
 
   const clientTxId = newId();
@@ -245,7 +252,12 @@ export async function runTrade(args: string[], deps: TradeDeps) {
     sizing: {
       mode: isIncrease ? 'increase' : 'initial',
       tier: perf.tier,
-      targetUsd: perf.notionalUsd,
+      equityUsd: round2(range.equityUsd),
+      tierPct: perf.equityPct,
+      // Initial copies are clamped to [minUsd, maxUsd]; increases use targetUsd under the 80% cap
+      minUsd: round2(range.minUsd),
+      maxUsd: round2(range.maxUsd),
+      targetUsd: round2(targetUsd),
       notionalUsd: sizing.notionalUsd,
       minFillNotionalUsd: sizing.minFillNotionalUsd,
       maxFillNotionalUsd: sizing.maxFillNotionalUsd,

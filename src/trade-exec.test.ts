@@ -111,7 +111,7 @@ test('adding at the existing leverage works; a new position sets its own', async
 
 // --- Price freshness ---
 
-test('size and limit come from the price fetched after the slow steps, so a short stays within $78.40', async () => {
+test('size and limit come from the price fetched after the slow steps, so a short stays within 10% of equity', async () => {
   const { hl, invo, trade } = setup();
   // The price rises 10% while the Invo stats lookup is in flight
   const lookup = invo.getPortfolioById.bind(invo);
@@ -121,11 +121,80 @@ test('size and limit come from the price fetched after the slow steps, so a shor
   assert.equal(out.status, 'filled');
   assert.equal(hl.orders[0].midPx, 110);
   assert.equal(out.sizing.mid, 110);
-  // Sized at the old $100 it would be 0.76 SOL: $85.27 at a $112.20 fill
+  // Equity $784 → max $78.40. Sized at the old $100 it would be 0.76 SOL: $85.27 at a $112.20 fill
   assert.ok(parseFloat(out.size) * 110 * 1.02 <= 78.4 + 1e-9, `${out.size} SOL at up to $112.20`);
   // Price fetched after the stats lookup and the leverage change, right before the order
   const at = (c: string) => hl.calls.lastIndexOf(c);
   assert.ok(at('setLeverage') < at('getAllMids') && at('getAllMids') < at('placeMarketOrder'), hl.calls.join(' '));
+});
+
+// --- Account-percentage sizing ---
+
+test('a new copy is the trader\'s tier % of current equity, within 5%–10%', async () => {
+  // Strong trader (fake stats) → 10%; manual → poor tier → 5%
+  for (const [mimic, pct] of [[meta('alice', 't1'), 10], ['manual', 5]] as const) {
+    const { hl, trade } = setup({ equity: 2000 });
+    const out = await trade(['SOL', 'long', 'auto', '5', mimic]);
+    assert.equal(out.status, 'filled');
+    assert.deepEqual(
+      [out.sizing.equityUsd, out.sizing.tierPct, out.sizing.minUsd, out.sizing.maxUsd, out.sizing.targetUsd],
+      [2000, pct, 100, 200, 2000 * pct / 100]);
+    // Worst-case fill within [$100, $200]
+    assert.ok(out.sizing.minFillNotionalUsd >= 100 && out.sizing.maxFillNotionalUsd <= 200, JSON.stringify(out.sizing));
+    assert.equal(hl.orders.length, 1);
+  }
+});
+
+test('equity is read fresh, after the slow steps, so a balance change during the stats lookup is used', async () => {
+  const { hl, invo, trade } = setup({ equity: 2000 });
+  const lookup = invo.getPortfolioById.bind(invo);
+  invo.getPortfolioById = async (id: string) => { hl.equity = 1000; return lookup(id); };
+  const out = await trade(['SOL', 'long', 'auto', '5', meta('alice', 't1')]);
+  assert.equal(out.sizing.equityUsd, 1000);
+  assert.ok(out.sizing.maxFillNotionalUsd <= 100, `${out.sizing.maxFillNotionalUsd} > 10% of $1,000`);
+  const at = (c: string) => hl.calls.lastIndexOf(c);
+  assert.ok(at('setLeverage') < at('getAccountEquity') && at('getAccountEquity') < at('placeMarketOrder'), hl.calls.join(' '));
+});
+
+test('a small account copies at least HL\'s $10 minimum; under $100 of equity it can\'t copy', async () => {
+  const small = setup({ equity: 150 }); // 5% = $7.50 → floor $10; max $15
+  const out = await small.trade(['SOL', 'long', 'auto', '5', 'manual']);
+  assert.equal(out.status, 'filled');
+  assert.deepEqual([out.sizing.minUsd, out.sizing.maxUsd], [10, 15]);
+  assert.ok(out.sizing.minFillNotionalUsd >= 10 && out.sizing.maxFillNotionalUsd <= 15, JSON.stringify(out.sizing));
+
+  const tiny = setup({ equity: 90 });
+  await assert.rejects(tiny.trade(['SOL', 'long', 'auto', '5', 'manual']), /Account equity \$90\.00 is too small to copy/);
+  assert.ok(!tiny.hl.calls.includes('placeMarketOrder'));
+  assert.equal(tiny.ledger.entries.length, 0);
+});
+
+test('unreadable equity stops the trade before any order', async () => {
+  const { hl, ledger, trade } = setup();
+  hl.getAccountEquity = async () => { throw new Error('clearinghouseState: no readable marginSummary.accountValue'); };
+  await assert.rejects(trade(['SOL', 'long', 'auto', '5', meta('alice', 't1')]), /no readable marginSummary/);
+  assert.ok(!hl.calls.includes('placeMarketOrder'));
+  assert.equal(ledger.entries.length, 0);
+  hl.getAccountEquity = async () => NaN;
+  await assert.rejects(trade(['SOL', 'long', 'auto', '5', meta('alice', 't2')]), /Invalid account equity/);
+});
+
+test('an increase is the tier % of equity, capped at 80% of the current position', async () => {
+  // Equity $2,000, strong → target $200. Position 1.00 SOL @ $100 = $100 → cap $80 wins
+  const capped = setup({ equity: 2000, positions: { SOL: 1 }, ledger: new MemoryLedgerStore([copyEntry('tx-a', 'SOL', 1, 'alice', 't1')]) });
+  const a = await capped.trade(['SOL', 'long', 'auto', '5', meta('alice', 't1', 't1-add')]);
+  assert.deepEqual([a.sizing.mode, a.sizing.targetUsd, a.sizing.capUsd, a.size], ['increase', 200, 80, '0.78']);
+
+  // Position 10 SOL = $1,000 → cap $800; the 10%-of-equity target ($200) wins
+  const big = setup({ equity: 2000, positions: { SOL: 10 }, ledger: new MemoryLedgerStore([copyEntry('tx-a', 'SOL', 10, 'alice', 't1')]) });
+  const b = await big.trade(['SOL', 'long', 'auto', '5', meta('alice', 't1', 't1-add')]);
+  assert.deepEqual([b.sizing.targetUsd, b.sizing.capUsd, b.size], [200, 800, '1.96']);
+  assert.ok(b.sizing.maxFillNotionalUsd <= 200);
+
+  // No 5% floor on adds: a poor trader's 5% ($100) on a $50 position → cap $40
+  const poorAdd = setup({ equity: 2000, positions: { SOL: 0.5 } });
+  const c = await poorAdd.trade(['SOL', 'long', 'auto', '5', 'manual']);
+  assert.deepEqual([c.sizing.targetUsd, c.sizing.capUsd, c.size], [100, 40, '0.39']);
 });
 
 // --- Trader (copy) path ---

@@ -60,6 +60,27 @@ export async function getPositions(wallet: string): Promise<{ coin: string; szi:
     .map((p: any) => p.position);
 }
 
+/**
+ * The account's Hyperliquid equity in USD: clearinghouseState marginSummary.accountValue
+ * (collateral plus unrealized P&L across cross and isolated positions). Throws on
+ * anything it can't read, so sizing fails closed.
+ */
+export async function getAccountEquity(wallet: string): Promise<number> {
+  const resp = await fetch('https://api.hyperliquid.xyz/info', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    ...timeoutSignal(),
+    body: JSON.stringify({ type: 'clearinghouseState', user: wallet }),
+  });
+  if (!resp.ok) throw new Error(`clearinghouseState: HTTP ${resp.status}`);
+  const data: any = await resp.json();
+  const equity = parseFloat(data?.marginSummary?.accountValue);
+  if (!Number.isFinite(equity)) {
+    throw new Error(`clearinghouseState: no readable marginSummary.accountValue (${JSON.stringify(data?.marginSummary)?.slice(0, 200)})`);
+  }
+  return equity;
+}
+
 export async function setLeverage(coin: string, leverage: number) {
   const s = getSdk();
   return withTimeout(s.exchange.updateLeverage(toSdkCoin(coin), 'isolated', leverage), `updateLeverage ${coin}`);

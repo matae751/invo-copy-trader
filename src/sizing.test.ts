@@ -6,8 +6,11 @@ import {
   sizeIncrease,
   limitPrice,
   fillPriceRange,
-  MIN_INITIAL_NOTIONAL_USD,
-  MAX_INITIAL_NOTIONAL_USD,
+  copyRange,
+  tierTargetUsd,
+  TIER_EQUITY_PCT,
+  MIN_EQUITY_PCT,
+  MAX_EQUITY_PCT,
   SLIPPAGE_PCT,
   type TraderStats,
 } from './sizing.js';
@@ -18,21 +21,21 @@ const strong: TraderStats = {
 
 // --- Tiers ---
 
-test('strong trader sizes at $78.40', () => {
+test('strong trader aims for 10% of equity', () => {
   const r = classifyTrader(strong);
   assert.equal(r.tier, 'strong');
-  assert.equal(r.notionalUsd, 78.4);
+  assert.equal(r.equityPct, 10);
 });
 
-test('average trader sizes at $50 or $60 by streak', () => {
+test('average trader aims for 6.4% or 7.7% of equity by streak', () => {
   assert.deepEqual(
-    [classifyTrader({ ...strong, currentWinStreak: 3 }).notionalUsd, classifyTrader({ ...strong, currentWinStreak: 7 }).notionalUsd],
-    [50, 60],
+    [classifyTrader({ ...strong, currentWinStreak: 3 }).equityPct, classifyTrader({ ...strong, currentWinStreak: 7 }).equityPct],
+    [6.4, 7.7],
   );
   // Long streak but win rate / W/L below strong thresholds
   const r = classifyTrader({ ...strong, winRate: 80, wonPositions: 80, lostPositions: 20 });
   assert.equal(r.tier, 'average');
-  assert.equal(r.notionalUsd, 60);
+  assert.equal(r.equityPct, 7.7);
 });
 
 test('strong boundaries are inclusive', () => {
@@ -41,7 +44,7 @@ test('strong boundaries are inclusive', () => {
   assert.equal(classifyTrader({ ...strong, currentWinStreak: 9 }).tier, 'average');
 });
 
-test('poor or missing performance sizes at $40', () => {
+test('poor or missing performance aims for 5% of equity', () => {
   const cases: (TraderStats | null)[] = [
     null,
     {},
@@ -56,12 +59,37 @@ test('poor or missing performance sizes at $40', () => {
   for (const c of cases) {
     const r = classifyTrader(c);
     assert.equal(r.tier, 'poor', JSON.stringify(c));
-    assert.equal(r.notionalUsd, 40);
+    assert.equal(r.equityPct, 5);
   }
 });
 
 test('no losses counts as infinite W/L', () => {
   assert.equal(classifyTrader({ ...strong, lostPositions: 0 }).tier, 'strong');
+});
+
+test('every tier percentage lies within the 5%–10% range', () => {
+  assert.deepEqual([MIN_EQUITY_PCT, MAX_EQUITY_PCT], [5, 10]);
+  for (const pct of Object.values(TIER_EQUITY_PCT)) assert.ok(pct >= MIN_EQUITY_PCT && pct <= MAX_EQUITY_PCT, String(pct));
+  assert.deepEqual(TIER_EQUITY_PCT, { poor: 5, averageShortStreak: 6.4, averageLongStreak: 7.7, strong: 10 });
+});
+
+// --- Equity range ---
+
+test('copyRange is 5%–10% of equity', () => {
+  assert.deepEqual(copyRange(2000), { equityUsd: 2000, minUsd: 100, maxUsd: 200 });
+  assert.deepEqual(copyRange(784), { equityUsd: 784, minUsd: 39.2, maxUsd: 78.4 });
+  // Tier targets at $2,000: poor $100, average $128 / $154, strong $200
+  assert.deepEqual(Object.values(TIER_EQUITY_PCT).map(p => Math.round(tierTargetUsd(2000, p) * 100) / 100), [100, 128, 154, 200]);
+});
+
+test('below $200 of equity the floor is HL\'s $10 minimum order; below $100 the account is too small', () => {
+  assert.deepEqual(copyRange(150), { equityUsd: 150, minUsd: 10, maxUsd: 15 }); // 5% would be $7.50
+  assert.deepEqual(copyRange(100), { equityUsd: 100, minUsd: 10, maxUsd: 10 });
+  assert.throws(() => copyRange(99.99), /Account equity \$99\.99 is too small to copy: 10% \(\$10\.00\) is below Hyperliquid's \$10 minimum order/);
+});
+
+test('copyRange rejects unusable equity', () => {
+  for (const bad of [0, -50, NaN, Infinity]) assert.throws(() => copyRange(bad), /Invalid account equity/, String(bad));
 });
 
 // --- Fill price range ---
@@ -127,6 +155,10 @@ test('fill range covers the rounded limit price even when rounding widens it', (
 
 // --- Initial sizing ---
 
+// Worst-case-fill mechanics with a fixed example band (hand-checked numbers below).
+// Equity-derived bands are covered further down.
+const BAND = { minUsd: 40, maxUsd: 78.4 };
+
 const assets = [
   { name: 'SOL', mid: 142.37, szDecimals: 2 },
   { name: 'BTC', mid: 97123.5, szDecimals: 5 },
@@ -139,21 +171,21 @@ const assets = [
   { name: 'SUB10', mid: 5.4321, szDecimals: 3 },
 ];
 
-test('initial size stays within [$40, $78.40] at every possible fill price, both sides', () => {
+test('initial size stays within the band at every possible fill price, both sides', () => {
   for (const a of assets) {
     for (const isBuy of [true, false]) {
       const px = fillPriceRange(a.mid, isBuy, a.szDecimals);
       for (const target of [0, 40, 50, 60, 78.4, 80, 1000]) {
-        const r = sizeInitial(target, a.mid, a.szDecimals, isBuy);
+        const r = sizeInitial(target, BAND, a.mid, a.szDecimals, isBuy);
         const qty = parseFloat(r.qty);
         const label = `${a.name} ${isBuy ? 'buy' : 'sell'} target ${target}: ${r.qty}`;
-        assert.ok(qty * px.lowPx >= MIN_INITIAL_NOTIONAL_USD - 1e-9, `${label} min fill $${qty * px.lowPx}`);
-        assert.ok(qty * px.highPx <= MAX_INITIAL_NOTIONAL_USD + 1e-9, `${label} max fill $${qty * px.highPx}`);
+        assert.ok(qty * px.lowPx >= BAND.minUsd - 1e-9, `${label} min fill $${qty * px.lowPx}`);
+        assert.ok(qty * px.highPx <= BAND.maxUsd + 1e-9, `${label} max fill $${qty * px.highPx}`);
         // Hard guarantee from the order's own limit price
-        if (isBuy) assert.ok(qty * r.limitPx <= MAX_INITIAL_NOTIONAL_USD + 1e-9, label);
-        else assert.ok(qty * r.limitPx >= MIN_INITIAL_NOTIONAL_USD - 1e-9, label);
+        if (isBuy) assert.ok(qty * r.limitPx <= BAND.maxUsd + 1e-9, label);
+        else assert.ok(qty * r.limitPx >= BAND.minUsd - 1e-9, label);
         // Reported range is within the band
-        assert.ok(r.minFillNotionalUsd >= MIN_INITIAL_NOTIONAL_USD && r.maxFillNotionalUsd <= MAX_INITIAL_NOTIONAL_USD, label);
+        assert.ok(r.minFillNotionalUsd >= BAND.minUsd && r.maxFillNotionalUsd <= BAND.maxUsd, label);
         // qty respects szDecimals
         const decimals = r.qty.includes('.') ? r.qty.split('.')[1].length : 0;
         assert.equal(decimals, a.szDecimals);
@@ -164,37 +196,71 @@ test('initial size stays within [$40, $78.40] at every possible fill price, both
 
 test('initial size converts USD to coin units within the worst-case band', () => {
   // mid $100, 2% → fills in [$98, $102]; qty band [ceil(40/98), floor(78.4/102)] = [0.41, 0.76]
-  assert.deepEqual(sizeInitial(50, 100, 2, true), {
+  assert.deepEqual(sizeInitial(50, BAND, 100, 2, true), {
     qty: '0.50', notionalUsd: 50, minFillNotionalUsd: 49, maxFillNotionalUsd: 51, limitPx: 102,
   });
-  assert.deepEqual(sizeInitial(78.4, 100, 2, true), {
+  assert.deepEqual(sizeInitial(78.4, BAND, 100, 2, true), {
     qty: '0.76', notionalUsd: 76, minFillNotionalUsd: 74.48, maxFillNotionalUsd: 77.52, limitPx: 102,
   });
-  assert.deepEqual(sizeInitial(40, 100, 2, false), {
+  assert.deepEqual(sizeInitial(40, BAND, 100, 2, false), {
     qty: '0.41', notionalUsd: 41, minFillNotionalUsd: 40.18, maxFillNotionalUsd: 41.82, limitPx: 98,
   });
 });
 
-test('regression: mid-only sizing could fill below $40 or above $78.40', () => {
+test('regression: mid-only sizing could fill below the band minimum or above its maximum', () => {
   // Old: 0.40 @ $100 = $40 at mid, but a sell filling at $98 = $39.20
-  assert.equal(sizeInitial(40, 100, 2, false).qty, '0.41');
+  assert.equal(sizeInitial(40, BAND, 100, 2, false).qty, '0.41');
   // Old: 0.78 @ $100 = $78 at mid, but a buy filling at $102 = $79.56
-  assert.equal(sizeInitial(78.4, 100, 2, true).qty, '0.76');
+  assert.equal(sizeInitial(78.4, BAND, 100, 2, true).qty, '0.76');
 });
 
 test('initial size refuses when one size step cannot land in the worst-case band', () => {
   // szDecimals 0 at $50: 1 coin fills in [$49, $51] — fits
-  assert.equal(sizeInitial(50, 50, 0, true).qty, '1');
+  assert.equal(sizeInitial(50, BAND, 50, 0, true).qty, '1');
   // At $39.50: 1 coin may fill < $40, 2 coins may fill > $78.40
-  assert.throws(() => sizeInitial(50, 39.5, 0, true), /too coarse/);
-  assert.throws(() => sizeInitial(50, 100, 0, true), /too coarse/);
+  assert.throws(() => sizeInitial(50, BAND, 39.5, 0, true), /too coarse/);
+  assert.throws(() => sizeInitial(50, BAND, 100, 0, true), /too coarse/);
   // At $77.50: fit at mid, but a buy filling at $79.05 exceeds $78.40
-  assert.throws(() => sizeInitial(78.4, 77.5, 0, true), /too coarse/);
+  assert.throws(() => sizeInitial(78.4, BAND, 77.5, 0, true), /too coarse/);
+});
+
+test('initial size stays within 5%–10% of equity at every fill price, for every tier and account size', () => {
+  for (const equity of [150, 500, 784, 2000, 10_000, 250_000]) {
+    const range = copyRange(equity);
+    for (const a of assets) {
+      for (const isBuy of [true, false]) {
+        const px = fillPriceRange(a.mid, isBuy, a.szDecimals);
+        for (const pct of Object.values(TIER_EQUITY_PCT)) {
+          const r = sizeInitial(tierTargetUsd(equity, pct), range, a.mid, a.szDecimals, isBuy);
+          const qty = parseFloat(r.qty);
+          const label = `equity ${equity} ${a.name} ${isBuy ? 'buy' : 'sell'} ${pct}%: ${r.qty}`;
+          assert.ok(qty * px.lowPx >= range.minUsd - 1e-9, `${label} min fill $${qty * px.lowPx} < $${range.minUsd}`);
+          assert.ok(qty * px.highPx <= range.maxUsd + 1e-9, `${label} max fill $${qty * px.highPx} > $${range.maxUsd}`);
+          assert.ok(qty * px.lowPx >= 10 - 1e-9, `${label} below HL's $10 minimum`);
+        }
+      }
+    }
+  }
+});
+
+test('a higher tier never sizes smaller than a lower one', () => {
+  const range = copyRange(2000);
+  const sizes = Object.values(TIER_EQUITY_PCT).map(p => parseFloat(sizeInitial(tierTargetUsd(2000, p), range, 100, 2, true).qty));
+  assert.deepEqual(sizes, [...sizes].sort((x, y) => x - y));
+  // 5% ($100) must hold even at a $98 fill → 1.03; 10% ($200) even at $102 → 1.96
+  assert.deepEqual(sizes, [1.03, 1.28, 1.54, 1.96]);
+});
+
+test('targets outside the band are clamped to it', () => {
+  const range = copyRange(2000);
+  assert.equal(sizeInitial(5, range, 100, 2, true).qty, sizeInitial(100, range, 100, 2, true).qty);
+  assert.equal(sizeInitial(10_000, range, 100, 2, true).qty, '1.96');
+  assert.throws(() => sizeInitial(50, { minUsd: 80, maxUsd: 40 }, 100, 2, true), /Invalid size range/);
 });
 
 test('initial size rejects bad prices', () => {
-  assert.throws(() => sizeInitial(50, 0, 2, true), /Invalid mid/);
-  assert.throws(() => sizeInitial(50, NaN, 2, true), /Invalid mid/);
+  assert.throws(() => sizeInitial(50, BAND, 0, 2, true), /Invalid mid/);
+  assert.throws(() => sizeInitial(50, BAND, NaN, 2, true), /Invalid mid/);
 });
 
 // --- Increases ---
@@ -240,12 +306,12 @@ test('increase refuses when the worst-case fill is below the $10 minimum order',
   assert.throws(() => sizeIncrease(78.4, 0, 100, 2, true), /Invalid current/);
 });
 
-test('multiple consecutive increases each respect the 80% cap and the position can exceed $78.40', () => {
+test('multiple consecutive increases each respect the 80% cap and the position can exceed 10% of equity', () => {
   const mid = 100;
   const szDecimals = 2;
   const { highPx } = fillPriceRange(mid, true, szDecimals);
   // Strong trader: initial 0.76 ($76 at mid, ≤ $77.52 at worst fill), then 5 increases
-  let qty = parseFloat(sizeInitial(78.4, mid, szDecimals, true).qty);
+  let qty = parseFloat(sizeInitial(78.4, BAND, mid, szDecimals, true).qty);
   assert.equal(qty, 0.76);
 
   const caps: number[] = [];
@@ -264,7 +330,7 @@ test('multiple consecutive increases each respect the 80% cap and the position c
   // $76 → cap $60.80 → +0.59 → $135 → cap $108, target $78.40 → +0.76 per step after that
   assert.deepEqual(adds, ['0.59', '0.76', '0.76', '0.76', '0.76']);
   assert.deepEqual(caps, [60.8, 108, 168.8, 229.6, 290.4]);
-  assert.ok(qty * mid > MAX_INITIAL_NOTIONAL_USD);
+  assert.ok(qty * mid > BAND.maxUsd);
   assert.equal(qty, 4.39);
 });
 
@@ -272,7 +338,7 @@ test('consecutive increases with a poor trader stay cap-limited when the positio
   const mid = 2;
   const szDecimals = 0;
   // Fills in [$1.96, $2.04]; initial band [ceil(40/1.96), floor(78.4/2.04)] = [21, 38]
-  let qty = parseFloat(sizeInitial(40, mid, szDecimals, true).qty);
+  let qty = parseFloat(sizeInitial(40, BAND, mid, szDecimals, true).qty);
   assert.equal(qty, 21);
 
   // $42 → cap $33.60 → floor(33.6/2.04) = 16 → $74 → cap $59.20, target $40 → floor(40/2.04) = 19 → ...
@@ -289,7 +355,7 @@ test('consecutive increases with a poor trader stay cap-limited when the positio
 
 test('increases after the price moves use current notional at that time', () => {
   const szDecimals = 2;
-  let qty = parseFloat(sizeInitial(40, 100, szDecimals, true).qty); // 0.41
+  let qty = parseFloat(sizeInitial(40, BAND, 100, szDecimals, true).qty); // 0.41
   assert.equal(qty, 0.41);
   // Price drops to $50: position is $20.50 → cap $16.40 → floor(16.4 / 51) = 0.32
   const r1 = sizeIncrease(78.4, qty * 50, 50, szDecimals, true);

@@ -21,6 +21,7 @@ runCommand(() => withFileLock(`${ledgerPath}.lock`, () => runTrade(process.argv.
     getAllMids: hl.getAllMids,
     getPositions: () => hl.getPositions(WALLET_ADDRESS),
     getOrderFill: cloid => hl.getOrderFill(WALLET_ADDRESS, cloid),
+    getAccountEquity: () => hl.getAccountEquity(WALLET_ADDRESS),
     setLeverage: hl.setLeverage,
     placeMarketOrder: hl.placeMarketOrder,
   },

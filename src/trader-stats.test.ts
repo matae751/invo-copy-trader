@@ -53,9 +53,9 @@ test('resolved stats drive the existing sizing tiers', async () => {
   const tierFor = async (over: object) =>
     classifyTrader((await getTraderStats(fakeClient({ byId: { [PID]: { success: true, portfolio: fullPortfolio(over) } } }), meta)).stats);
 
-  assert.deepEqual([(await tierFor({})).tier, (await tierFor({})).notionalUsd], ['strong', 78.4]);
-  assert.equal((await tierFor({ currentWinStreak: 7 })).notionalUsd, 60);
-  assert.equal((await tierFor({ currentWinStreak: 3 })).notionalUsd, 50);
+  assert.deepEqual([(await tierFor({})).tier, (await tierFor({})).equityPct], ['strong', 10]);
+  assert.equal((await tierFor({ currentWinStreak: 7 })).equityPct, 7.7);
+  assert.equal((await tierFor({ currentWinStreak: 3 })).equityPct, 6.4);
   assert.equal((await tierFor({ currentWinStreak: 0 })).tier, 'poor');
   assert.equal((await tierFor({ liquidated: true })).tier, 'poor');
   assert.equal((await tierFor({ percentChange: -3 })).tier, 'poor');
@@ -116,7 +116,7 @@ test('missing mimicMeta ids give no stats without any API call', async () => {
     const r = await getTraderStats(client, m);
     assert.equal(r.stats, null);
     assert.equal(client.calls.list.length + client.calls.byId.length, 0);
-    assert.equal(classifyTrader(r.stats).notionalUsd, 40);
+    assert.equal(classifyTrader(r.stats).equityPct, 5);
   }
 });
 
