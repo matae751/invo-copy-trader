@@ -4,6 +4,8 @@
 // unfollows anyone. Network access goes through an injected client so this
 // module is testable without hitting Invo.
 
+import { mimicMetaFromUpdate, missingMimicMetaFields } from './mimic-meta.js';
+
 // Endpoints verified against the Invo web app and live responses:
 //   GET  /v1_0/users/get_user                → { user: { id, username, ... } }
 //   POST /v1_0/users/get_following           → { page, size, success, error, following: [{ id, username, ... }] }
@@ -154,6 +156,13 @@ export function classifyPost(post: any, followed: Map<string, FollowedTrader>): 
   if (isClosed) action = 'close';
   else if (update.changes?.isAdded !== false) action = 'open';
   else action = 'increase';
+
+  // Opens/increases are copied with trade.ts, which needs the trader's trade IDs.
+  // Closes don't (close.ts works by coin), and dropping one would leave our copy open.
+  if (action !== 'close') {
+    const missing = missingMimicMetaFields(mimicMetaFromUpdate(update));
+    if (missing.length) return { kind: 'reject', reason: `trade is missing ${missing.join(', ')}`, ...ctx };
+  }
 
   return { kind: 'accept', trader, portfolio, action };
 }

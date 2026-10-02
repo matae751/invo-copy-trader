@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mimicMetaFromUpdate, parseMimicMeta } from './mimic-meta.js';
+import { mimicMetaFromUpdate, parseMimicMeta, parseMimicMetaArg } from './mimic-meta.js';
 
 // Feed post `update` shape (the trader's investment): { id, baseId, baseShortId, owner: { id }, portfolio: { id }, ... }
 const update = {
@@ -40,4 +40,21 @@ test('rejects the old monitor mimicMeta shape', () => {
 
 test('rejects non-objects', () => {
   for (const bad of [null, 'x', 1, []]) assert.throws(() => parseMimicMeta(bad));
+});
+
+// --- trade.ts argument ---
+
+test('trade.ts requires mimicMeta — a missing argument never becomes made-up IDs', () => {
+  for (const arg of [undefined, '', '  ']) assert.throws(() => parseMimicMetaArg(arg), /mimicMeta is required/);
+});
+
+test('trade.ts accepts the signal\'s mimicMeta JSON', () => {
+  const meta = mimicMetaFromUpdate(update);
+  assert.deepEqual(parseMimicMetaArg(JSON.stringify(meta)), meta);
+  assert.throws(() => parseMimicMetaArg('{not json'), /not valid JSON/);
+  assert.throws(() => parseMimicMetaArg('{}'), /missing/);
+});
+
+test('\'manual\' means a trade that copies nobody (no mimicMeta)', () => {
+  assert.equal(parseMimicMetaArg('manual'), null);
 });

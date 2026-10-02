@@ -217,6 +217,9 @@ function tradePost(over: { post?: any; update?: any } = {}) {
     owner: { id: 'u1', username: 'alice' },
     ...over.post,
     update: {
+      id: 'upd-1',
+      baseId: 'base-1',
+      baseShortId: 'aB3xY9_kLm',
       ticker: 'SOL',
       verifiedTrade: true,
       owner: { id: 'u1', username: 'alice' },
@@ -280,4 +283,19 @@ test('action rules: open, increase, close', () => {
   assert.equal(action({ isOpen: true, changes: { isAdded: true } }), 'open');
   assert.equal(action({ isOpen: true, changes: { isAdded: false } }), 'increase');
   assert.equal(action({ isOpen: false, closingPrice: 150 }), 'close');
+});
+
+test('rejects opens and increases missing the trader\'s trade ids', () => {
+  for (const changes of [{ isAdded: true }, { isAdded: false }]) {
+    const v = classifyPost(tradePost({ update: { changes, baseShortId: undefined } }), followed);
+    assert.equal(v.kind === 'reject' && v.reason, 'trade is missing sourcePaperTradeBaseShortId');
+  }
+  const v = classifyPost(tradePost({ update: { id: null, baseId: '', baseShortId: '  ' } }), followed);
+  assert.equal(v.kind === 'reject' && v.reason,
+    'trade is missing initialSourcePaperUpdateId, sourcePaperTradeBaseId, sourcePaperTradeBaseShortId');
+});
+
+test('close signals are accepted without trade ids (close.ts works by coin)', () => {
+  const v = classifyPost(tradePost({ update: { isOpen: false, closingPrice: 150, id: null, baseId: null, baseShortId: null } }), followed);
+  assert.equal(v.kind === 'accept' && v.action, 'close');
 });

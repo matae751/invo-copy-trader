@@ -37,7 +37,7 @@ You (Claude) ── reasoning + UI ── agentic decision loop
   ├── src/commands/follow.ts    → social graph management (ONLY when the user explicitly asks)
   ├── src/commands/monitor.ts   → real-time signal detection from the account's Invo following list (background)
   ├── src/commands/trade.ts     → open position (HL exchange + Invo wallet)
-  └── src/commands/close.ts     → close position (HL exchange + Invo wallet)
+  └── src/commands/close.ts     → close one trader's copy (matched via the copy ledger)
       │
       ├── src/invo-client.ts    → Invo REST API (auto-refresh JWT, 350-day token)
       └── src/hl-client.ts      → Hyperliquid SDK (phantom agent signing)
@@ -310,6 +310,7 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
 - Polls `POST /dex/trade` every 5 seconds (trade status updates) — only when watch entries provided
 - Polls `POST /v1_0/posts/get_feed` (filter: `following`) every 5 seconds (new signals)
 - A post is a signal only if: `verifiedTrade: true`, not a repost, owner is in the current following list, and the portfolio belongs to that trader
+- Open/increase signals must also carry the trader's trade IDs (`id`, `baseId`, `baseShortId`), or they are skipped with `reason: "trade is missing ..."`. Close signals are passed through either way, but `close.ts` refuses one that doesn't name the trader and their trade.
 - Deduplicates by post ID / update key
 - Outputs JSON lines:
   - `{"type":"started",...}` — initial status (stdout)
@@ -402,7 +403,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts > ~/invo-copy-trader/mo
 > **CLI ONLY** — run the command below. Do NOT use browser tools.
 
 ```bash
-cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto [leverage] ['<mimicMetaJson>']
+cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto <leverage> '<mimicMetaJson>'
 ```
 
 **Arguments:**
@@ -417,8 +418,9 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
   - A position in the opposite direction makes `trade.ts` refuse the trade.
   - USD is converted to coin units with the current mid price and the asset's szDecimals.
   - All limits hold at the **worst-case fill**, not just at mid: the order is an IOC limit at mid ± 2%, so size is chosen so any fill in that range stays within $40-$78.40 (initial) or under the 80% cap (increase). E.g. at mid $100 the initial size is at most 0.76 coins (≤ $77.52 even at a $102 fill).
-- `leverage`: integer 1-50 (default: 1). Max varies by asset (SOL: 20x, BTC: 40x)
-- `mimicMetaJson`: the signal's `mimicMeta`, passed unchanged. **Always pass it when copying a signal.** `trade.ts` validates it before placing any order and refuses if a field is missing or if it is the old `{baseId, baseShortId}` shape.
+- `leverage`: **required**, a whole number from 1 up to the asset's Hyperliquid max (SOL: 20x, BTC: 40x). `trade.ts` refuses anything else, including a value above that max, before setting leverage or placing an order.
+- `mimicMetaJson`: **required.** Pass the signal's `mimicMeta` unchanged. `trade.ts` checks it before placing any order. It refuses if the argument is missing, is not JSON, has a missing field, or uses the old `{baseId, baseShortId}` shape. It never makes up IDs.
+  - Only when the user explicitly asks for a trade that copies nobody, pass the literal `manual` instead. Invo gets no `mimicMeta` (as the Invo app does for its own trades), and size falls to the poor tier ($40). Never use `manual` for a signal.
 
 **What happens under the hood:**
 1. Connects HL SDK with agent key (phantom agent signing)
@@ -455,8 +457,11 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
     "reasons": ["streak 3, WR 88%, W/L 6.10, P&L 900%"],
     "ignoredSizeArg": "auto"
   },
+  "manual": false,
   "sourceBaseShortId": "aB3xY9_kLm",
   "positionRecordId": "uuid",
+  "filledQty": 0.49,
+  "ledger": { "entryId": "uuid", "copyQty": 0.49 },
   "clientTxId": "uuid",
   "qtyBefore": "0",
   "qtyAfter": "0.14",
@@ -465,7 +470,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
 }
 ```
 
-**Save `sourceBaseShortId`** (the trader's `baseShortId`). Use it in `/dex/trade` watch entries for this position. **Do not** pass it to `close.ts`, because it identifies the trader's trade, not yours.
+**Save `sourceBaseShortId`** (the trader's `baseShortId`). Use it in `/dex/trade` watch entries for this position. To close, pass the **close signal's** `mimicMeta` to `close.ts`. The ledger entry `trade.ts` recorded (`ledger.entryId`) is what it matches against.
 
 **Show execution panel:**
 ```
@@ -498,18 +503,31 @@ npx tsx src/commands/trade.ts SOL long auto 5 '<signal.mimicMeta as JSON>'
 > **CLI ONLY** — run the command below. Do NOT use browser tools.
 
 ```bash
-cd ~/invo-copy-trader && npx tsx src/commands/close.ts <coin> [baseShortId]
+cd ~/invo-copy-trader && npx tsx src/commands/close.ts <coin> '<close signal mimicMeta JSON>'
 ```
 
 **Arguments:**
-- `coin`: the asset to close (must have an open position)
-- `baseShortId`: **normally omit it.** Invo auto-detects the HL close within ~30s. Pass one only if you have **your own** position's `baseShortId` from Invo. `trade.ts` doesn't output one, because `/dex/position/create` doesn't return it. Never pass the trader's `sourceBaseShortId`.
+- `coin`: the asset from the close signal
+- `mimicMeta`: **required.** Pass the close signal's `mimicMeta` unchanged. It identifies the trader (`creatorInvoUserId`) and their trade (`sourcePaperTradeBaseId` / `sourcePaperTradeBaseShortId`).
+- `manual` instead of `mimicMeta`: **only on explicit user request.** It flattens the whole coin position, including every copy and manual trade in it, and marks all of them closed in the ledger.
 
-**What happens:**
-1. Reads current position from HL (size + direction)
-2. Places opposite-direction IOC limit order (full size → flatten)
-3. If baseShortId provided: records close via `POST /dex/position/close`
-4. Outputs JSON with close details
+**How a close is matched:** every fill `trade.ts` makes is recorded in the copy ledger (`data/copy-ledger.json`) against the trader and trade it copied. Hyperliquid nets all fills in a coin into one position, so the ledger is the only record of whose part is whose. A close signal:
+1. Must name a trader and at least one of their trade IDs, otherwise it is **refused**.
+2. Must match exactly one open ledger entry with the same coin, trader and trade, otherwise it is **refused**. Another trader's close on the same coin never matches. A manual trade is never closed by a signal.
+3. Closes **only that copy's quantity** (opposite-direction IOC, rounded down to the lot size). Other copies in the coin stay open.
+
+It is also **refused**, with no order, if:
+- there is no HL position;
+- the position is in the other direction;
+- the position is smaller than the copies tracked in it (something reduced it outside the ledger; you can't tell whose part is gone).
+
+Every refusal before the position check happens without touching Hyperliquid.
+
+**Output:** `status` is `closed`, `partial` (IOC partly filled; the ledger keeps the rest open), `not_filled` or `refused` (with a `reason`). It also includes `entryId`, `trader`, `requestedQty`, `closedQty` and `copyQtyLeft`. The exit code is non-zero for `refused`, `not_filled`, or a ledger write failure.
+
+Invo isn't called. It auto-detects HL closes. `/dex/position/close` needs your own position's `baseShortId`, which `/dex/position/create` never returns.
+
+Positions opened before the ledger existed (or in the Invo app) aren't in the ledger, so signals can't close them. Close those with `manual` only if the user asks, or in the app.
 
 **Show close panel:**
 ```
@@ -547,7 +565,7 @@ You are not a passive executor — you are an **autonomous trading agent**. Make
    - Does this align with the trader's usual pattern?
    - Are multiple top traders converging on the same trade? (High conviction)
 
-4. **Position sizing**: Handled by `trade.ts` — always pass the signal's `mimicMeta` so the trader's stats can be looked up (without it, size falls back to $40). Do not try to size trades yourself.
+4. **Position sizing**: Handled by `trade.ts` — pass the signal's `mimicMeta` (required) so the trader's stats can be looked up. If the stats lookup fails, size falls back to $40. Do not try to size trades yourself.
 
 5. **Exit strategy**: Mirror the trader. This is copy trading — we trust their exits.
    - When the copied trader closes → we close (via monitor close signal)
@@ -560,6 +578,7 @@ Keep track of open positions mentally:
 - Which coin, direction, size, leverage
 - **Trader's `baseShortId`** (`sourceBaseShortId` from `trade.ts` output, `= signal.mimicMeta.sourcePaperTradeBaseShortId`), needed for `/dex/trade` polling
 - `positionRecordId` from `trade.ts` output (Invo's record of your copy)
+- `ledger.entryId` from `trade.ts` output. The copy ledger (`data/copy-ledger.json`) is what `close.ts` matches close signals against. If `ledger.error` is set after a fill, tell the user: that copy can't be closed by a signal.
 - Entry price (from trade output)
 - Which trader you copied
 
@@ -649,9 +668,9 @@ Run the phases sequentially. Each phase builds on the previous one.
 2. **Discover (optional)**: Only if the user asks — run `discover.ts` and present suggestions. Do not act on them.
 3. **Followed traders**: Nothing to run — the user follows/unfollows in the Invo app. Never call `follow.ts` unless explicitly asked.
 4. **Monitor**: Start `monitor.ts` in background (no ID arguments). Show the `following_loaded` list, then react to signals.
-5. **Trade**: When a signal arrives (or on manual decision), evaluate it against the decision framework, then execute via `trade.ts` with the signal's `mimicMeta`. Record `sourceBaseShortId` and `positionRecordId`.
+5. **Trade**: When a signal arrives, evaluate it against the decision framework, then execute via `trade.ts` with the signal's `mimicMeta`. Use `manual` only for a trade the user explicitly asks for outside any signal. Record `sourceBaseShortId` and `positionRecordId`.
 6. **Manage**: Continue monitoring. Track open positions, entry prices, and P&L. React to close signals or hit your exit criteria.
-7. **Close**: Exit positions via `close.ts` when the copied trader exits, your take-profit/stop-loss hits, or market conditions change.
+7. **Close**: When the copied trader exits, run `close.ts <coin> '<close signal mimicMeta>'`. It closes only that trader's copy. Use `close.ts <coin> manual` only when the user explicitly asks to flatten a coin.
 
 The agent can loop phases 4-7 indefinitely. Changes to the Invo following list are picked up by the running monitor automatically.
 

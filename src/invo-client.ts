@@ -183,7 +183,8 @@ export interface RecordOpenPayload {
     qtyAfter: string;
     intendedLeverage: number;
   };
-  mimicMeta: {
+  /** Omitted for manual (non-copy) trades, as the Invo app does. */
+  mimicMeta?: {
     portfolioId: string;
     creatorInvoUserId: string;
     initialSourcePaperUpdateId: string;

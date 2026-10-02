@@ -45,7 +45,7 @@ A fully autonomous copy trading system that connects [Invo](https://app.invoapp.
 │   ├── follow.ts     ── social graph management                  │
 │   ├── monitor.ts    ── event-driven signal detection            │
 │   ├── trade.ts      ── open position (HL + Invo)                │
-│   └── close.ts      ── close position (HL + Invo)               │
+│   └── close.ts      ── close one trader's copy (copy ledger)    │
 │         │                                                       │
 │    ┌────┴────────────────────┐                                  │
 │    ▼                         ▼                                  │
@@ -97,14 +97,16 @@ All commands run via `npx tsx src/commands/<cmd>.ts`.
 | `monitor.ts` | Real-time signal monitor (your Invo following list) | `npx tsx src/commands/monitor.ts` |
 | `monitor.ts` | Feed + trade polling | `npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"..."}]'` |
 | `monitor.ts` | Wait-for-signal mode | `npx tsx src/commands/monitor.ts --wait-for-signal` |
-| `trade.ts` | Open a position | `npx tsx src/commands/trade.ts SOL long 0.14 5` |
-| `close.ts` | Close a position | `npx tsx src/commands/close.ts SOL [baseShortId]` |
+| `trade.ts` | Open a position (copy) | `npx tsx src/commands/trade.ts SOL long auto 5 '<signal.mimicMeta JSON>'` |
+| `trade.ts` | Open a position (copies nobody) | `npx tsx src/commands/trade.ts SOL long auto 5 manual` |
+| `close.ts` | Close one trader's copy | `npx tsx src/commands/close.ts SOL '<close signal mimicMeta JSON>'` |
+| `close.ts` | Flatten a coin (explicit user request) | `npx tsx src/commands/close.ts SOL manual` |
 
 ## Signal Detection
 
 The monitor copies **only the traders your Invo account currently follows**. At startup it loads your following list (`POST /v1_0/users/get_following`) and resolves each trader's portfolios (`POST /v1_0/portfolios/v2/get_users_portfolios`), then re-fetches the list every 60s (`--refresh=<sec>`, min 10) and on demand when the feed shows an unknown trader. Follow or unfollow people in the Invo app — the monitor picks it up on the next refresh or restart and prints a `following_changed` line. It never follows or unfollows anyone itself, and exits if the following list can't be loaded at startup.
 
-A feed post becomes a `signal` only if it's a verified trade (`verifiedTrade: true`), not a repost, its owner is in the current following list, and its portfolio belongs to that trader. Other trade posts are logged to stderr as `{"type":"skipped","reason":...}`. Each signal contains:
+A feed post becomes a `signal` only if it's a verified trade (`verifiedTrade: true`), not a repost, its owner is in the current following list, and its portfolio belongs to that trader. Open and increase signals must also include the trader's trade IDs (`id`, `baseId`, `baseShortId`); close signals don't need them. Other trade posts are logged to stderr as `{"type":"skipped","reason":...}`. Each signal contains:
 
 ```
 Feed post (postTypeId: "investment" | "update")
@@ -155,7 +157,9 @@ Signal detected: @trader opened SOL long 8x
   │      └── Output: sourceBaseShortId (trader's) + positionRecordId (ours)
   │
   └── 4. Monitor for exit
-         └── When trader closes → mirror the exit via close.ts
+         └── When trader closes → close.ts with the close signal's mimicMeta
+                closes only that trader's copy (matched in data/copy-ledger.json);
+                other copies in the same coin stay open. Unmatched → refused.
 ```
 
 **Exit strategy: mirror the trader.** We close when they close. No independent TP/SL — the whole point of copy trading is trusting the trader's entries AND exits.
