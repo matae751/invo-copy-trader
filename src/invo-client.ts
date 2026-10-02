@@ -188,9 +188,11 @@ export interface RecordOpenPayload {
     creatorInvoUserId: string;
     initialSourcePaperUpdateId: string;
     sourcePaperTradeBaseId: string;
+    sourcePaperTradeBaseShortId?: string;
   };
 }
 
+/** Response (per the Invo web app): { positionRecordId, eventId, cloids, oids } — no baseShortId. */
 export async function recordOpen(payload: RecordOpenPayload) {
   return post('/dex/position/create', payload);
 }

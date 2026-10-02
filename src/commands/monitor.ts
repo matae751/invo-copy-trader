@@ -2,6 +2,7 @@ import { validateEnv, INVO_TOKEN, INVO_REFRESH_TOKEN } from '../env.js';
 import * as invo from '../invo-client.js';
 import { FollowedTraderRegistry } from '../followed-registry.js';
 import { classifyPost } from '../following.js';
+import { mimicMetaFromUpdate } from '../mimic-meta.js';
 
 validateEnv();
 if (INVO_TOKEN) invo.setToken(INVO_TOKEN);
@@ -193,12 +194,9 @@ async function main() {
             openPositions: update.portfolio?.openPositionsCount,
             pnl: update.portfolio?.plSnapshot,
           },
-          mimicMeta: {
-            portfolioId: update.portfolio?.id,
-            creatorInvoUserId: update.owner.id,
-            baseId: update.baseId,
-            baseShortId: update.baseShortId,
-          },
+          // Invo's /dex/position/create shape — pass as-is to trade.ts.
+          // sourcePaperTradeBaseShortId is the trader's baseShortId (use it for /dex/trade watch entries)
+          mimicMeta: mimicMetaFromUpdate(update),
         }));
         signalFound = true;
       }

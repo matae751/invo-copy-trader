@@ -116,10 +116,11 @@ Feed post (postTypeId: "investment" | "update")
       ├── closingPrice     → exit price (on close)
       ├── isOpen           → position state
       ├── verifiedTrade    → confirmed real Invo trade
-      ├── portfolio.id     → portfolioId (for mimicMeta)
-      ├── owner.id         → creatorInvoUserId (for mimicMeta)
-      ├── baseId           → trade base ID (for mimicMeta)
-      └── baseShortId      → needed to close on Invo
+      ├── portfolio.id     → mimicMeta.portfolioId
+      ├── owner.id         → mimicMeta.creatorInvoUserId
+      ├── id               → mimicMeta.initialSourcePaperUpdateId
+      ├── baseId           → mimicMeta.sourcePaperTradeBaseId
+      └── baseShortId      → mimicMeta.sourcePaperTradeBaseShortId (trader's; for /dex/trade polling)
 ```
 
 **Two monitor modes:**
@@ -150,8 +151,8 @@ Signal detected: @trader opened SOL long 8x
   │
   ├── 3. Record on Invo
   │      ├── POST /dex/position/create
-  │      ├── mimicMeta from signal (portfolioId, ownerId, baseId)
-  │      └── Save baseShortId for exit
+  │      ├── mimicMeta from signal, passed unchanged (validated before any order)
+  │      └── Output: sourceBaseShortId (trader's) + positionRecordId (ours)
   │
   └── 4. Monitor for exit
          └── When trader closes → mirror the exit via close.ts
@@ -267,7 +268,7 @@ Composite score: `W/L*20 + WinRate*1.5 + P&L*0.01 + Streak*2 - Losses*0.5`
 | `"Price must be divisible by tick size"` | Too many decimal places | Use `toPrecision(5)` on prices (handled in `hl-client.ts`) |
 | `"Order has invalid size"` | Wrong szDecimals for the asset | Check asset table above |
 | `"Order price cannot be more than 95% away"` | Position too large for available margin | Reduce size |
-| `/dex/trade` returns 404 | Using your own `baseShortId` instead of the trader's | Use the trader's `baseShortId` from their feed signal |
+| `/dex/trade` returns 404 | Polling with a `baseShortId` that isn't the trader's | Use `signal.mimicMeta.sourcePaperTradeBaseShortId` (= `trade.ts` `sourceBaseShortId`) |
 | Agent key expired | ~90-day validity | Re-authorize in Invo app |
 | Feed signal delay | Trade posts appear 1-10s after execution | Acceptable for copy trading (not HFT) |
 

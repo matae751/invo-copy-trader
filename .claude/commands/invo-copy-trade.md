@@ -331,9 +331,11 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
   "followed": { "userId": "uuid", "username": "trader1" },
   "trade": { "coin": "SOL", "name": "...", "side": "long", "leverage": 5, "entryPrice": 142.5, "closingPrice": null, "entrySize": 2.5, "isOpen": true },
   "portfolio": { "id": "uuid", "title": "...", "winRate": 91.2, "closedPositions": 140, "openPositions": 2, "pnl": 1234 },
-  "mimicMeta": { "portfolioId": "uuid", "creatorInvoUserId": "uuid", "baseId": "uuid", "baseShortId": "aB3xY9_kLm" }
+  "mimicMeta": { "portfolioId": "uuid", "creatorInvoUserId": "uuid", "initialSourcePaperUpdateId": "uuid", "sourcePaperTradeBaseId": "uuid", "sourcePaperTradeBaseShortId": "aB3xY9_kLm" }
 }
 ```
+
+`mimicMeta` is already in the shape `/dex/position/create` expects (same fields the Invo web app sends). Pass it to `trade.ts` unchanged. `sourcePaperTradeBaseShortId` is the **trader's** `baseShortId`.
 
 **Use `--wait-for-signal` mode for efficient, reactive monitoring.** This is the recommended approach — zero polling, zero wasted tokens:
 
@@ -416,7 +418,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
   - USD is converted to coin units with the current mid price and the asset's szDecimals.
   - All limits hold at the **worst-case fill**, not just at mid: the order is an IOC limit at mid ± 2%, so size is chosen so any fill in that range stays within $40-$78.40 (initial) or under the 80% cap (increase). E.g. at mid $100 the initial size is at most 0.76 coins (≤ $77.52 even at a $102 fill).
 - `leverage`: integer 1-50 (default: 1). Max varies by asset (SOL: 20x, BTC: 40x)
-- `mimicMetaJson`: optional, for linking to a specific trader's portfolio. If omitted, generates random UUIDs (valid — server checks format not existence)
+- `mimicMetaJson`: the signal's `mimicMeta`, passed unchanged. **Always pass it when copying a signal.** `trade.ts` validates it before placing any order and refuses if a field is missing or if it is the old `{baseId, baseShortId}` shape.
 
 **What happens under the hood:**
 1. Connects HL SDK with agent key (phantom agent signing)
@@ -428,10 +430,10 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
    - Uses `reduce_only: false` (true breaks phantom agent signature recovery)
 6. Snapshots position after
 7. Records on Invo via `POST /dex/position/create` with full payload:
-   - `mimicMeta` (4 UUID fields — random is fine)
+   - `mimicMeta` from the signal (portfolioId, creatorInvoUserId, initialSourcePaperUpdateId, sourcePaperTradeBaseId, sourcePaperTradeBaseShortId)
    - `submission` (hlOrder + hlResponse + nonceMs)
    - `summary` (qtyBefore, qtyAfter, intendedLeverage)
-8. Outputs JSON with fill details + `baseShortId` (SAVE THIS for closing)
+8. Outputs JSON with fill details, `sourceBaseShortId` (the trader's) and `positionRecordId` (Invo's record of your copy)
 
 **Output shape:**
 ```json
@@ -453,7 +455,8 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
     "reasons": ["streak 3, WR 88%, W/L 6.10, P&L 900%"],
     "ignoredSizeArg": "auto"
   },
-  "baseShortId": "aB3xY9_kLm",
+  "sourceBaseShortId": "aB3xY9_kLm",
+  "positionRecordId": "uuid",
   "clientTxId": "uuid",
   "qtyBefore": "0",
   "qtyAfter": "0.14",
@@ -462,7 +465,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
 }
 ```
 
-**CRITICAL: Save the `baseShortId`** from the output — you need it for Phase 5.
+**Save `sourceBaseShortId`** (the trader's `baseShortId`). Use it in `/dex/trade` watch entries for this position. **Do not** pass it to `close.ts`, because it identifies the trader's trade, not yours.
 
 **Show execution panel:**
 ```
@@ -478,15 +481,15 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
 ║  │  ────────────────────────────────────────────────────────     │   ║
 ║  │  Hyperliquid:  ✓ Order filled (IOC limit)                     │   ║
 ║  │  Invo Wallet:  ✓ Position recorded                            │   ║
-║  │  Base ID:      aB3xY9_kLm                                    │   ║
+║  │  Trader trade: aB3xY9_kLm                                    │   ║
 ║  └──────────────────────────────────────────────────────────────┘   ║
 ║  Position is now live. Monitoring for exit signals...                ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-**To pass real mimicMeta** (linking to the trader you're copying):
+**Passing mimicMeta** (links your copy to the trader's trade). Copy the signal's `mimicMeta` exactly:
 ```bash
-npx tsx src/commands/trade.ts SOL long 0.14 5 '{"portfolioId":"<from discover>","creatorInvoUserId":"<trader ownerId>","initialSourcePaperUpdateId":"<any uuid>","sourcePaperTradeBaseId":"<any uuid>"}'
+npx tsx src/commands/trade.ts SOL long auto 5 '<signal.mimicMeta as JSON>'
 ```
 
 ---
@@ -500,7 +503,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/close.ts <coin> [baseShortId]
 
 **Arguments:**
 - `coin`: the asset to close (must have an open position)
-- `baseShortId`: from trade.ts output. If provided, records close on Invo. If omitted, Invo auto-detects the HL close within ~30s.
+- `baseShortId`: **normally omit it.** Invo auto-detects the HL close within ~30s. Pass one only if you have **your own** position's `baseShortId` from Invo. `trade.ts` doesn't output one, because `/dex/position/create` doesn't return it. Never pass the trader's `sourceBaseShortId`.
 
 **What happens:**
 1. Reads current position from HL (size + direction)
@@ -555,8 +558,8 @@ You are not a passive executor — you are an **autonomous trading agent**. Make
 
 Keep track of open positions mentally:
 - Which coin, direction, size, leverage
-- **Your `baseShortId`** from `trade.ts` output (needed for `/dex/position/close`)
-- **Trader's `baseShortId`** from the signal `mimicMeta` (needed for `/dex/trade` polling)
+- **Trader's `baseShortId`** (`sourceBaseShortId` from `trade.ts` output, `= signal.mimicMeta.sourcePaperTradeBaseShortId`), needed for `/dex/trade` polling
+- `positionRecordId` from `trade.ts` output (Invo's record of your copy)
 - Entry price (from trade output)
 - Which trader you copied
 
@@ -564,7 +567,7 @@ Keep track of open positions mentally:
 
 - **"Unknown asset: SOL"**: The HL SDK (v1.7.7) requires `-PERP` suffix (e.g., `SOL-PERP`). The `hl-client.ts` `toSdkCoin()` helper handles this. The REST API uses raw names (`SOL`).
 - **"Price must be divisible by tick size"**: Limit price has too many significant figures. Use `toPrecision(5)` not `toPrecision(6)`.
-- **`/dex/trade` 404**: You're polling with the wrong `baseShortId`. Use the **trader's** `baseShortId` from `signal.mimicMeta.baseShortId`, not your client-generated one.
+- **`/dex/trade` 404**: You're polling with the wrong `baseShortId`. Use the **trader's** `baseShortId` from `signal.mimicMeta.sourcePaperTradeBaseShortId`.
 - **"Order has invalid size"**: Wrong szDecimals. SOL=2, BTC=5, ETH=4, XRP=0, DOGE=0.
 - **"No mid price for X"**: Asset not on HL. Check the coin name matches HL universe exactly.
 - **"Wrong signer recovery"**: Agent key expired (~90 day lifetime). User needs to re-authorize in Invo app.
@@ -592,7 +595,7 @@ All requests use `POST` with `Authorization: Bearer <jwt>`, `Content-Type: appli
 | `POST /v1_0/users/get_following` | Users the account follows | `{userId, query: null, params: {page, size: 20}}` → `{page, size, success, error, following: [{id, username, isPending, ...}]}` |
 | `POST /v1_0/portfolios/v2/get_users_portfolios` | A user's portfolios | `{userId, params: {isDeleted: false, page, size: 20}}` → `{portfolios: [{id, ownerId, title, winRate, ...}]}` |
 | `POST /dex/account/ready` | Check trading status | `{}` |
-| `POST /dex/trade` | Poll trade updates | `{investments: [{baseShortId, mimicStartedAt}]}` — **use the TRADER's baseShortId from the signal, NOT your client-generated one** |
+| `POST /dex/trade` | Poll trade updates | `{investments: [{baseShortId, mimicStartedAt}]}` — **use the TRADER's baseShortId** (`signal.mimicMeta.sourcePaperTradeBaseShortId`) |
 | `POST /dex/position/create` | Record open in Invo wallet | Full payload (see RecordOpenPayload) |
 | `POST /dex/position/close` | Record close in Invo wallet | Full payload (see RecordClosePayload) |
 | `GET /investment/status/:id` | Investment status | — |
@@ -602,11 +605,11 @@ All requests use `POST` with `Authorization: Bearer <jwt>`, `Content-Type: appli
 - `filter` values for discover: `trending`, `all`, `user` — note `get_portfolios_pl` **ignores a top-level `userId`** (returns other owners' portfolios); use `get_users_portfolios` to list one user's portfolios
 - `filter` values for feed: `trending`, `following`, `all`
 - `page` is nested inside `params`, NOT top-level (causes 500 if wrong)
-- `mimicMeta` requires 4 UUID-format strings — random UUIDs are accepted
-- `baseShortId` is a 10-char nanoid. There are TWO different ones:
-  - **Trader's baseShortId** (from signal `mimicMeta.baseShortId`) — use this for `/dex/trade` polling
-  - **Your baseShortId** (client-generated in `trade.ts`) — use this for `/dex/position/close`
-  - Using your own baseShortId in `/dex/trade` causes 404 errors
+- `mimicMeta` fields, as the Invo web app builds them from the trader's feed `update`: `portfolioId` ← `portfolio.id`, `creatorInvoUserId` ← `owner.id`, `initialSourcePaperUpdateId` ← `id`, `sourcePaperTradeBaseId` ← `baseId`, `sourcePaperTradeBaseShortId` ← `baseShortId`
+- `/dex/position/create` returns `{positionRecordId, eventId, cloids, oids}`. It doesn't return a `baseShortId` for your copy.
+- `baseShortId` is a 10-char nanoid:
+  - **Trader's baseShortId** (`mimicMeta.sourcePaperTradeBaseShortId`): use it for `/dex/trade` polling
+  - `/dex/position/close` takes an optional `baseShortId` for **your** position. Omit it; Invo auto-detects HL closes
 
 ### Hyperliquid Info API (`api.hyperliquid.xyz/info`)
 
@@ -646,7 +649,7 @@ Run the phases sequentially. Each phase builds on the previous one.
 2. **Discover (optional)**: Only if the user asks — run `discover.ts` and present suggestions. Do not act on them.
 3. **Followed traders**: Nothing to run — the user follows/unfollows in the Invo app. Never call `follow.ts` unless explicitly asked.
 4. **Monitor**: Start `monitor.ts` in background (no ID arguments). Show the `following_loaded` list, then react to signals.
-5. **Trade**: When a signal arrives (or on manual decision), evaluate it against the decision framework, then execute via `trade.ts`. Record the `baseShortId`.
+5. **Trade**: When a signal arrives (or on manual decision), evaluate it against the decision framework, then execute via `trade.ts` with the signal's `mimicMeta`. Record `sourceBaseShortId` and `positionRecordId`.
 6. **Manage**: Continue monitoring. Track open positions, entry prices, and P&L. React to close signals or hit your exit criteria.
 7. **Close**: Exit positions via `close.ts` when the copied trader exits, your take-profit/stop-loss hits, or market conditions change.
 

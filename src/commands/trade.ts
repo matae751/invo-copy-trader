@@ -1,21 +1,14 @@
-import { randomUUID, randomBytes } from 'crypto';
+import { randomUUID } from 'crypto';
 import { validateEnv, INVO_TOKEN, INVO_REFRESH_TOKEN, HL_AGENT_KEY, WALLET_ADDRESS } from '../env.js';
 import * as invo from '../invo-client.js';
 import * as hl from '../hl-client.js';
 import { classifyTrader, sizeInitial, sizeIncrease, SLIPPAGE_PCT } from '../sizing.js';
 import { getTraderStats } from '../trader-stats.js';
+import { parseMimicMeta } from '../mimic-meta.js';
 
 validateEnv();
 if (INVO_TOKEN) invo.setToken(INVO_TOKEN);
 if (INVO_REFRESH_TOKEN) invo.setRefreshToken(INVO_REFRESH_TOKEN);
-
-function genBaseShortId(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
-  const bytes = randomBytes(10);
-  let id = '';
-  for (const b of bytes) id += chars[b % chars.length];
-  return id;
-}
 
 async function main() {
   // <size> is kept for argument-position compatibility but ignored: size is computed here
@@ -28,7 +21,8 @@ async function main() {
 
   const isBuy = side === 'long';
   const leverage = parseInt(leverageStr ?? '1', 10);
-  const mimicMetaArg = mimicMetaJson ? JSON.parse(mimicMetaJson) : null;
+  // Validated before touching HL: a copy must carry the trader's trade IDs (incl. their baseShortId)
+  const mimicMetaArg = mimicMetaJson ? parseMimicMeta(JSON.parse(mimicMetaJson)) : null;
 
   await hl.connect(HL_AGENT_KEY, WALLET_ADDRESS);
 
@@ -75,8 +69,6 @@ async function main() {
   const updated = posAfter.find((p: any) => p.coin === coin);
   const qtyAfter = updated ? updated.szi : '0';
 
-  // IDs
-  const baseShortId = genBaseShortId();
   const clientTxId = randomUUID();
 
   // Build mimicMeta (accept from arg or generate random UUIDs)
@@ -137,7 +129,10 @@ async function main() {
       statsLookup: statsLookup.status,
       ignoredSizeArg: ignoredSizeArg ?? null,
     },
-    baseShortId,
+    // Trader's baseShortId (for /dex/trade watch entries) — null when no mimicMeta was passed
+    sourceBaseShortId: mimicMetaArg?.sourcePaperTradeBaseShortId ?? null,
+    // Invo's record of our copy. /dex/position/create returns no baseShortId of ours.
+    positionRecordId: invoResult?.positionRecordId ?? null,
     clientTxId,
     qtyBefore,
     qtyAfter,
