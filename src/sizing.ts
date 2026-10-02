@@ -84,16 +84,32 @@ function roundQty(qty: number, szDecimals: number): number {
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
-/** IOC limit price for a market-style order. Used by hl-client, so sizing sees the exact price sent. */
-export function limitPrice(mid: number, isBuy: boolean, slippagePct = SLIPPAGE_PCT): number {
+/** Hyperliquid perps: a price may have at most this many decimals minus the asset's szDecimals. */
+export const MAX_PERP_PRICE_DECIMALS = 6;
+
+/**
+ * IOC limit price for a market-style order. Used by hl-client, so sizing sees the exact price sent.
+ * Hyperliquid accepts at most 5 significant figures AND at most 6 − szDecimals decimals
+ * (e.g. 0.55407 is rejected for szDecimals 2). The decimal cut rounds away from mid
+ * (buy up, sell down), so it never makes the order less likely to fill.
+ */
+export function limitPrice(mid: number, isBuy: boolean, szDecimals: number, slippagePct = SLIPPAGE_PCT): number {
   const rawPx = isBuy ? mid * (1 + slippagePct) : mid * (1 - slippagePct);
-  return parseFloat(rawPx.toPrecision(5));
+  const px = parseFloat(rawPx.toPrecision(5));
+  const decimals = Math.max(0, MAX_PERP_PRICE_DECIMALS - szDecimals);
+  const f = 10 ** decimals;
+  // Tolerance so a price already on the grid isn't pushed a tick by float error
+  const ticks = isBuy ? Math.ceil(px * f - 1e-6) : Math.floor(px * f + 1e-6);
+  if (!(ticks > 0)) {
+    throw new Error(`Can't express a ${isBuy ? 'buy' : 'sell'} limit price near ${mid} with ${decimals} decimals (szDecimals ${szDecimals})`);
+  }
+  return Number((ticks / f).toFixed(decimals));
 }
 
 /** Lowest and highest price an order is assumed to fill at. */
-export function fillPriceRange(mid: number, isBuy: boolean, slippagePct = SLIPPAGE_PCT) {
-  const limitPx = limitPrice(mid, isBuy, slippagePct);
-  // toPrecision rounding can push the limit slightly past mid × (1 ± s); take the wider side
+export function fillPriceRange(mid: number, isBuy: boolean, szDecimals: number, slippagePct = SLIPPAGE_PCT) {
+  const limitPx = limitPrice(mid, isBuy, szDecimals, slippagePct);
+  // Rounding can push the limit slightly past mid × (1 ± s); take the wider side
   return isBuy
     ? { limitPx, lowPx: mid * (1 - slippagePct), highPx: Math.max(limitPx, mid * (1 + slippagePct)) }
     : { limitPx, lowPx: Math.min(limitPx, mid * (1 - slippagePct)), highPx: mid * (1 + slippagePct) };
@@ -135,7 +151,7 @@ export function sizeInitial(
   slippagePct = SLIPPAGE_PCT,
 ): SizeResult {
   assertPrice(mid, szDecimals);
-  const px = fillPriceRange(mid, isBuy, slippagePct);
+  const px = fillPriceRange(mid, isBuy, szDecimals, slippagePct);
   const lo = ceilQty(MIN_INITIAL_NOTIONAL_USD / px.lowPx, szDecimals);
   const hi = floorQty(MAX_INITIAL_NOTIONAL_USD / px.highPx, szDecimals);
   if (lo > hi || hi <= 0) {
@@ -167,7 +183,7 @@ export function sizeIncrease(
 ): IncreaseResult {
   assertPrice(mid, szDecimals);
   if (!(currentNotionalUsd > 0)) throw new Error(`Invalid current position notional: ${currentNotionalUsd}`);
-  const px = fillPriceRange(mid, isBuy, slippagePct);
+  const px = fillPriceRange(mid, isBuy, szDecimals, slippagePct);
   const capUsd = currentNotionalUsd * MAX_INCREASE_FRACTION;
   const addUsd = Math.min(targetUsd, capUsd);
   const qty = floorQty(addUsd / px.highPx, szDecimals);

@@ -123,6 +123,7 @@ test('copying a trader sends their mimicMeta, sizes from their stats and records
   assert.equal(hl.orders.length, 1);
   assert.equal(hl.orders[0].isBuy, true);
   assert.equal(hl.orders[0].reduceOnly, false);
+  assert.equal(hl.orders[0].szDecimals, 2);
   assert.equal(out.status, 'filled');
 
   assert.equal(out.manual, false);

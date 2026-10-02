@@ -66,23 +66,61 @@ test('no losses counts as infinite W/L', () => {
 
 // --- Fill price range ---
 
-test('limitPrice matches the original placeMarketOrder formula', () => {
-  for (const mid of [142.37, 97123.5, 0.31234, 2.3456, 123.456]) {
+test('limitPrice matches the original formula when 5 significant figures fit the decimal limit', () => {
+  for (const [mid, szDecimals] of [[142.37, 2], [97123.5, 5], [0.31234, 0], [2.3456, 0], [123.456, 2]] as const) {
     for (const isBuy of [true, false]) {
       const raw = isBuy ? mid * 1.02 : mid * 0.98;
-      assert.equal(limitPrice(mid, isBuy), parseFloat(parseFloat(raw.toPrecision(5)).toString()));
+      assert.equal(limitPrice(mid, isBuy, szDecimals), parseFloat(parseFloat(raw.toPrecision(5)).toString()));
     }
   }
   assert.equal(SLIPPAGE_PCT, 0.02);
 });
 
+const decimalsOf = (x: number) => (String(x).split('.')[1] ?? '').length;
+const sigFigsOf = (x: number) => String(x).replace('.', '').replace(/^0+/, '').replace(/0+$/, '').length;
+
+test('limitPrice never exceeds 6 − szDecimals decimals or 5 significant figures (HL price rule)', () => {
+  for (const mid of [0.00123456, 0.0123456, 0.54321, 0.98765, 1.00321, 5.4321, 9.99987, 54.321, 142.37, 3012.34, 97123.5, 123456.7]) {
+    for (let szDecimals = 0; szDecimals <= 5; szDecimals++) {
+      for (const isBuy of [true, false]) {
+        let px: number;
+        try {
+          px = limitPrice(mid, isBuy, szDecimals);
+        } catch (e: any) {
+          // Only when the decimal grid can't hold a positive price (e.g. $0.0012 with 2 decimals, selling)
+          assert.match(e.message, /Can't express a (buy|sell) limit price/);
+          assert.ok(!isBuy && mid * 0.98 < 10 ** -(6 - szDecimals), `mid ${mid} szDecimals ${szDecimals}: ${e.message}`);
+          continue;
+        }
+        const label = `mid ${mid} szDecimals ${szDecimals} ${isBuy ? 'buy' : 'sell'} -> ${px}`;
+        assert.ok(px > 0, label);
+        assert.ok(decimalsOf(px) <= 6 - szDecimals, `${label}: ${decimalsOf(px)} decimals`);
+        assert.ok(Number.isInteger(px) || sigFigsOf(px) <= 5, `${label}: ${sigFigsOf(px)} sig figs`);
+      }
+    }
+  }
+});
+
+test('the decimal cut rounds away from mid, so the order is never less likely to fill', () => {
+  // 0.54321 × 1.02 = 0.5540742 → 0.55407 (5 sig figs) → 4 decimals allowed for szDecimals 2
+  assert.equal(limitPrice(0.54321, true, 2), 0.5541);
+  assert.equal(limitPrice(0.54321, false, 2), 0.5323); // 0.53235 → down
+  assert.equal(limitPrice(5.4321, true, 3), 5.541); // 5.5407 → up
+  assert.equal(limitPrice(5.4321, false, 3), 5.323); // 5.3235 → down
+  assert.equal(limitPrice(0.00123456, true, 0), 0.00126); // 0.0012593 → 6 decimals
+  for (const [mid, sz] of [[0.54321, 2], [5.4321, 3], [0.00123456, 0], [0.98765, 3]] as const) {
+    assert.ok(limitPrice(mid, true, sz) >= mid * 1.02 - 1e-12 || limitPrice(mid, true, sz) >= parseFloat((mid * 1.02).toPrecision(5)));
+    assert.ok(limitPrice(mid, true, sz) > mid && limitPrice(mid, false, sz) < mid);
+  }
+});
+
 test('fill range covers the rounded limit price even when rounding widens it', () => {
   // 123.456 × 1.02 = 125.92512 → toPrecision(5) = 125.93 (above the raw 2%)
-  const buy = fillPriceRange(123.456, true);
+  const buy = fillPriceRange(123.456, true, 2);
   assert.equal(buy.limitPx, 125.93);
   assert.equal(buy.highPx, 125.93);
   // 123.456 × 0.98 = 120.98688 → 120.99 (above raw, so the raw 2% stays the low bound)
-  const sell = fillPriceRange(123.456, false);
+  const sell = fillPriceRange(123.456, false, 2);
   assert.equal(sell.limitPx, 120.99);
   assert.ok(Math.abs(sell.lowPx - 123.456 * 0.98) < 1e-9);
 });
@@ -96,12 +134,15 @@ const assets = [
   { name: 'XRP', mid: 2.3456, szDecimals: 0 },
   { name: 'DOGE', mid: 0.31234, szDecimals: 0 },
   { name: 'ROUNDUP', mid: 123.456, szDecimals: 2 },
+  // Where 5 significant figures exceed HL's decimal limit, so the decimal cut applies
+  { name: 'LOWPX', mid: 0.54321, szDecimals: 2 },
+  { name: 'SUB10', mid: 5.4321, szDecimals: 3 },
 ];
 
 test('initial size stays within [$40, $78.40] at every possible fill price, both sides', () => {
   for (const a of assets) {
     for (const isBuy of [true, false]) {
-      const px = fillPriceRange(a.mid, isBuy);
+      const px = fillPriceRange(a.mid, isBuy, a.szDecimals);
       for (const target of [0, 40, 50, 60, 78.4, 80, 1000]) {
         const r = sizeInitial(target, a.mid, a.szDecimals, isBuy);
         const qty = parseFloat(r.qty);
@@ -179,7 +220,7 @@ test('increase below the cap uses the tier target at worst-case fill', () => {
 test('increase never exceeds the cap at any fill price', () => {
   for (const a of assets) {
     for (const isBuy of [true, false]) {
-      const px = fillPriceRange(a.mid, isBuy);
+      const px = fillPriceRange(a.mid, isBuy, a.szDecimals);
       for (const current of [40, 55.5, 78.4, 150, 1000]) {
         for (const target of [40, 50, 60, 78.4]) {
           const r = sizeIncrease(target, current, a.mid, a.szDecimals, isBuy);
@@ -202,7 +243,7 @@ test('increase refuses when the worst-case fill is below the $10 minimum order',
 test('multiple consecutive increases each respect the 80% cap and the position can exceed $78.40', () => {
   const mid = 100;
   const szDecimals = 2;
-  const { highPx } = fillPriceRange(mid, true);
+  const { highPx } = fillPriceRange(mid, true, szDecimals);
   // Strong trader: initial 0.76 ($76 at mid, ≤ $77.52 at worst fill), then 5 increases
   let qty = parseFloat(sizeInitial(78.4, mid, szDecimals, true).qty);
   assert.equal(qty, 0.76);

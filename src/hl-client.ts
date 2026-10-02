@@ -1,5 +1,5 @@
 import { Hyperliquid } from 'hyperliquid';
-import { limitPrice, SLIPPAGE_PCT } from './sizing.js';
+import { limitPrice } from './sizing.js';
 import { timeoutSignal, withTimeout } from './timeout.js';
 
 const INVO_BUILDER = { address: '0x557edb253b1d7ed5f15b248a5a3fd919fa5d3c81', fee: 35 };
@@ -69,16 +69,16 @@ export async function placeMarketOrder(
   coin: string,
   isBuy: boolean,
   size: string,
-  slippagePct = SLIPPAGE_PCT,
-  midPx?: number, // reuse the price the size was computed from
-  reduceOnly = false, // closes pass true: the order can only shrink the position, never flip it
+  slippagePct: number,
+  midPx: number, // the price the size was computed from
+  szDecimals: number, // the asset's, so the limit price meets HL's decimal rule
+  reduceOnly: boolean, // closes pass true: the order can only shrink the position, never flip it
   cloid?: string, // client order id, so the order can be looked up if we lose its response
 ) {
-  const mid = midPx ?? parseFloat((await getAllMids())[coin]);
-  if (!mid) throw new Error(`No mid price for ${coin}`);
+  if (!(midPx > 0)) throw new Error(`No mid price for ${coin}`);
 
   // Same function sizing.ts bounds fills against
-  const limitPx = limitPrice(mid, isBuy, slippagePct).toString();
+  const limitPx = limitPrice(midPx, isBuy, szDecimals, slippagePct).toString();
 
   const s = getSdk();
   return withTimeout(s.exchange.placeOrder({
@@ -116,18 +116,6 @@ export async function getOrderFill(wallet: string, cloid: string): Promise<{ kno
     throw new Error(`orderStatus ${cloid}: unrecognised response ${JSON.stringify(data)?.slice(0, 200)}`);
   }
   return { known: true, filledQty: Math.max(0, origSz - left) };
-}
-
-export async function closePosition(coin: string, wallet: string) {
-  const positions = await getPositions(wallet);
-  const pos = positions.find((p: any) => p.coin === coin);
-  if (!pos) throw new Error(`No open position for ${coin}`);
-
-  const size = Math.abs(parseFloat(pos.szi));
-  const isLong = parseFloat(pos.szi) > 0;
-
-  // Close = opposite direction
-  return placeMarketOrder(coin, !isLong, size.toString(), 0.02, undefined, true);
 }
 
 export { INVO_BUILDER };

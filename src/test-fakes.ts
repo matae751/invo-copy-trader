@@ -63,7 +63,7 @@ export function fakeHl(opts: {
   const positions: Record<string, number> = { ...opts.positions };
   const mids = { SOL: 100, BTC: 60000, ETH: 3000, ...opts.mids };
   const calls: string[] = [];
-  const orders: { coin: string; isBuy: boolean; size: string; slippagePct: number; midPx: number; reduceOnly: boolean; cloid: string }[] = [];
+  const orders: { coin: string; isBuy: boolean; size: string; slippagePct: number; midPx: number; szDecimals: number; reduceOnly: boolean; cloid: string }[] = [];
   const leverage: [string, number][] = [];
   const fills: Record<string, number> = { ...opts.orderFills };
   const coinLeverage: Record<string, { type?: string; value?: number } | undefined> = Object.fromEntries(
@@ -93,9 +93,9 @@ export function fakeHl(opts: {
       coinLeverage[coin] = { type: 'isolated', value: lev };
       return { status: 'ok', response: { type: 'default' } };
     },
-    async placeMarketOrder(coin, isBuy, size, slippagePct, midPx, reduceOnly, cloid) {
+    async placeMarketOrder(coin, isBuy, size, slippagePct, midPx, szDecimals, reduceOnly, cloid) {
       calls.push('placeMarketOrder');
-      orders.push({ coin, isBuy, size, slippagePct, midPx, reduceOnly, cloid });
+      orders.push({ coin, isBuy, size, slippagePct, midPx, szDecimals, reduceOnly, cloid });
       if (opts.orderThrows === 'before') throw new Error('ECONNRESET');
       opts.beforeOrder?.(positions);
       if (opts.rejectOrder) return { status: 'err', response: 'Insufficient margin to place order.' };

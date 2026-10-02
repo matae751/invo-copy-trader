@@ -6,7 +6,7 @@
 // Anything that can't be matched is refused before any order is placed.
 // `manual` (explicit user request only) closes the whole coin position.
 
-import { SLIPPAGE_PCT } from './sizing.js';
+import { SLIPPAGE_PCT, limitPrice } from './sizing.js';
 import {
   parseCloseIdentity,
   findCopyToClose,
@@ -230,6 +230,12 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   if (plan.kind === 'refuse') return refuse(coin, plan.reason, entry.id, session.settled);
 
   const mid = await midFor(deps.hl, coin);
+  // The price the order will carry must be valid before anything is written or sent
+  try {
+    limitPrice(mid, !plan.isLong, szDecimals);
+  } catch (e: any) {
+    return refuse(coin, e.message, entry.id, session.settled);
+  }
   const cloid = (deps.newCloid ?? randomCloid)();
 
   // Written before the order is sent, so a lost response is settled by cloid next run
@@ -245,7 +251,7 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   let orderError: string | null = null;
   let requestFailed = false;
   try {
-    hlResult = await deps.hl.placeMarketOrder(coin, !plan.isLong, plan.qty.toFixed(szDecimals), SLIPPAGE_PCT, mid, true, cloid);
+    hlResult = await deps.hl.placeMarketOrder(coin, !plan.isLong, plan.qty.toFixed(szDecimals), SLIPPAGE_PCT, mid, szDecimals, true, cloid);
     orderError = orderRejection(hlResult);
   } catch (e: any) {
     requestFailed = true;
@@ -336,12 +342,17 @@ async function manualClose(coin: string, deps: CloseDeps, now: () => Date): Prom
   }
 
   const mid = await midFor(deps.hl, coin);
+  try {
+    limitPrice(mid, !(before.szi > 0), szDecimals);
+  } catch (e: any) {
+    return refuse(coin, e.message, undefined, session.settled);
+  }
   const cloid = (deps.newCloid ?? randomCloid)();
   let hlResult: any = null;
   let orderError: string | null = null;
   let requestFailed = false;
   try {
-    hlResult = await deps.hl.placeMarketOrder(coin, !(before.szi > 0), qty.toFixed(szDecimals), SLIPPAGE_PCT, mid, true, cloid);
+    hlResult = await deps.hl.placeMarketOrder(coin, !(before.szi > 0), qty.toFixed(szDecimals), SLIPPAGE_PCT, mid, szDecimals, true, cloid);
     orderError = orderRejection(hlResult);
   } catch (e: any) {
     requestFailed = true;

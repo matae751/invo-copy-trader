@@ -308,6 +308,26 @@ test('the position read failing after a close does not lose the fill', async () 
   assert.deepEqual(ledger.entries.map(e => [e.status, e.qty]), [['closed', 0], ['open', 0.3]]);
 });
 
+// --- Order price ---
+
+test('close orders carry the asset\'s szDecimals so the limit price meets HL\'s decimal rule', async () => {
+  const ledger = new MemoryLedgerStore([aliceSol]);
+  const hl = fakeHl({ positions: { SOL: 0.5 } });
+  await close(['SOL', JSON.stringify(signalMeta('alice', 't1'))], ledger, hl);
+  assert.deepEqual(hl.orders.map(o => o.szDecimals), [2]);
+});
+
+test('a price that can\'t be expressed is refused before the ledger or HL order is touched', async () => {
+  const ledger = new MemoryLedgerStore([copyEntry('tx-b', 'BTC', 0.001, 'alice', 't1')]);
+  // BTC (szDecimals 5) allows 1 decimal: a sell limit near $0.04 floors to 0
+  const hl = fakeHl({ positions: { BTC: 0.001 }, mids: { BTC: 0.04 } });
+  const out = await close(['BTC', JSON.stringify(signalMeta('alice', 't1'))], ledger, hl);
+  assert.equal(out.status, 'refused');
+  if (out.status === 'refused') assert.match(out.reason, /Can't express a sell limit price/);
+  assert.ok(!hl.calls.includes('placeMarketOrder'));
+  assert.equal(ledger.saves, 0);
+});
+
 test('`manual` with no position refuses without an order', async () => {
   const hl = fakeHl({ positions: {} });
   const out = await close(['SOL', 'manual'], new MemoryLedgerStore(), hl);

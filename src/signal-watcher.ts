@@ -17,7 +17,7 @@
 //    poll, a close signal is sent for every remembered trade we still hold an
 //    open copy of — so a copy opened just after its trader closed is still
 //    closed, and a close that didn't complete (not filled, partial, unknown,
-//    refused for a passing reason) is re-sent every closeRetryMs, up to
+//    refused for a passing reason) is re-sent every closeRetryMs (90s), up to
 //    maxCloseAttempts; then one close_stuck alert asks for the user.
 //  - Opens/updates are only emitted if the post itself is recent (createdAt):
 //    a newly followed trader's older posts appearing in the feed are not new trades.
@@ -137,7 +137,11 @@ export interface WatchEvent {
 
 export const DEFAULT_MAX_CATCHUP_SEC = 300;
 export const DEFAULT_MAX_SIGNAL_AGE_SEC = 300;
-export const DEFAULT_CLOSE_RETRY_SEC = 60;
+/**
+ * Longer than MIN_SETTLE_AGE_MS (60s): a retry after an `unknown` close must find the
+ * earlier order old enough to settle, or close.ts refuses it and the attempt is wasted.
+ */
+export const DEFAULT_CLOSE_RETRY_SEC = 90;
 export const DEFAULT_MAX_CLOSE_ATTEMPTS = 10;
 export const DEFAULT_CLOSED_TRADE_RETENTION_SEC = 24 * 3600;
 

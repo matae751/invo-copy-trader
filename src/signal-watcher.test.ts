@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SignalWatcher, type MonitorState, type StateStore, type WatchEntry } from './signal-watcher.js';
+import { SignalWatcher, DEFAULT_CLOSE_RETRY_SEC, type MonitorState, type StateStore, type WatchEntry } from './signal-watcher.js';
+import { MIN_SETTLE_AGE_MS } from './pending-orders.js';
 import type { FollowedTrader } from './following.js';
 import type { CopyEntry } from './copy-ledger.js';
 import { copyEntry } from './test-fakes.js';
@@ -293,7 +294,7 @@ test('an open or update of a trade whose close was seen in an earlier poll is no
   assert.deepEqual(skipped(events).map(x => x.reason).sort(), ['open of a trade that is already closed', 'update of a trade that is already closed']);
 });
 
-test('a close that did not complete is re-sent every minute while the copy is open, then stops', async () => {
+test('a close that did not complete is re-sent every 90s while the copy is open, then stops', async () => {
   const ledger: CopyEntry[] = [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')];
   const { invo, make, advance } = setup({ ledger });
   const w = make();
@@ -302,15 +303,20 @@ test('a close that did not complete is re-sent every minute while the copy is op
   assert.deepEqual(signals(await w.poll()).map(x => [x.attempt, x.retry]), [[1, undefined]]);
 
   // close.ts didn't fill: the copy is still open
-  advance(30_000);
+  advance(60_000);
   assert.deepEqual(signals(await w.poll()), []);
   advance(30_000);
   assert.deepEqual(signals(await w.poll()).map(x => [x.attempt, x.retry, x.mimicMeta.sourcePaperTradeBaseId]), [[2, true, 'base-t1']]);
 
   // Now it closed
   ledger[0] = { ...ledger[0], status: 'closed', qty: 0 };
-  advance(60_000);
+  advance(90_000);
   assert.deepEqual(signals(await w.poll()), []);
+});
+
+test('a close retry never comes before an unsettled close order can be settled', () => {
+  // Otherwise the retry after an `unknown` close is refused as "may still arrive" and the attempt is wasted
+  assert.ok(DEFAULT_CLOSE_RETRY_SEC * 1000 > MIN_SETTLE_AGE_MS + 15_000);
 });
 
 test('retries survive a restart (--wait-for-signal) and give up with one close_stuck alert', async () => {

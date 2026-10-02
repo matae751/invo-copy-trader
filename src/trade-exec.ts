@@ -43,7 +43,7 @@ export interface ExecHl extends OrderLookup {
    * cloid lets the order be looked up (getOrderFill) if its response is lost.
    */
   placeMarketOrder(
-    coin: string, isBuy: boolean, size: string, slippagePct: number, midPx: number, reduceOnly: boolean, cloid: string,
+    coin: string, isBuy: boolean, size: string, slippagePct: number, midPx: number, szDecimals: number, reduceOnly: boolean, cloid: string,
   ): Promise<any>;
 }
 
@@ -223,7 +223,7 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   let orderError: string | null = null;
   let requestFailed = false;
   try {
-    orderResult = await hl.placeMarketOrder(coin, isBuy, sizeStr, SLIPPAGE_PCT, mid, false, cloid);
+    orderResult = await hl.placeMarketOrder(coin, isBuy, sizeStr, SLIPPAGE_PCT, mid, szDecimals, false, cloid);
     orderError = orderRejection(orderResult);
   } catch (e: any) {
     // May or may not have reached HL — resolveFill looks it up by cloid

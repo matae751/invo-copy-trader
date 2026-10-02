@@ -314,7 +314,7 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
 - **Opens/updates must be recent:** only emitted if the post's `createdAt` is at most `--max-signal-age` seconds old (default 300). Older ones — e.g. a newly followed trader's earlier posts appearing in the feed — and posts without a readable `createdAt` are `skipped`, never copied.
 - **Every close is remembered for 24h** (in the monitor state), and a close signal is sent for each remembered trade **we hold an open copy of**:
   - a close seen before our copy was recorded (the trader closed while `trade.ts` was running) is sent as soon as the copy appears in the ledger, and a later open/update of a closed trade is `skipped`;
-  - while the copy stays open (`not_filled`, `partial`, `unknown`, or a passing `refused`), the close is **re-sent every 60s** (`"retry": true`, `"attempt": n`), up to 10 times — including across monitor restarts;
+  - while the copy stays open (`not_filled`, `partial`, `unknown`, or a passing `refused`), the close is **re-sent every 90s** (`"retry": true`, `"attempt": n`), up to 10 times — including across monitor restarts;
   - after 10 attempts it sends one `{"type":"close_stuck",...}` instead (stdout, ends `--wait-for-signal`): tell the user that copy needs them.
   - Closes of trades we hold no copy of are `skipped` (`"close of a trade we hold no copy of — remembered in case one is opened"`). If the ledger can't be read, each newly seen followed-trader close is passed on once.
 - Open/update signals must also carry the trader's trade IDs (`id`, `baseId`, `baseShortId`), or they are skipped with `reason: "trade is missing ..."`. Close signals are passed through either way, but `close.ts` refuses one that doesn't name the trader and their trade.
@@ -368,7 +368,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal
 
 **When notified of a signal:**
 1. Parse every signal JSON line from the process output
-2. `close` → run `close.ts <coin> '<mimicMeta>'` (no evaluation needed: it only closes a matching copy). If it doesn't close the copy, just relaunch the monitor: it re-sends the close every 60s while the copy is open. `close_stuck` → tell the user which copy is stuck and why (`close.ts` output); don't loop on it
+2. `close` → run `close.ts <coin> '<mimicMeta>'` (no evaluation needed: it only closes a matching copy). If it doesn't close the copy, just relaunch the monitor: it re-sends the close every 90s while the copy is open. `close_stuck` → tell the user which copy is stuck and why (`close.ts` output); don't loop on it
 3. `open` → evaluate against the locked-in criteria (risk mode, max leverage, auto-copy threshold). If auto-copy is ON and the trader meets the WR threshold → `trade.ts` automatically; otherwise present the SIGNAL DETECTED panel and ask the user
 4. `update` → **never auto-copy.** It may be an add, a partial close or an edit, and copying a reduce as an add grows our position. Show the panel (with `trade.entrySize`) and ask the user. Only if they confirm the trader added to the position, run `trade.ts` with the signal's `mimicMeta` (it sizes it as an increase)
 5. `catchUp: true` → the post was made while the monitor was stopped; say so, and treat an open as staler than usual
