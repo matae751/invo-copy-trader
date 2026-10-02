@@ -138,7 +138,8 @@ Signal detected: @trader opened SOL long 8x
   │      ├── Leverage ≤ max? (e.g., 8x ≤ 20x ✓)
   │      ├── Asset allowed? (SOL not blocked ✓)
   │      ├── Trader WR ≥ auto-copy threshold? (86% ≥ 80% ✓)
-  │      └── Position size within limit? (30% of balance ✓)
+  │      └── Size computed in code (src/sizing.ts): $40-$78.40 initial by trader tier;
+  │          increases capped at 80% of current position notional
   │
   ├── 2. Execute on Hyperliquid
   │      ├── Set leverage (8x isolated)

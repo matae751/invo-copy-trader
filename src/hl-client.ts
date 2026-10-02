@@ -1,4 +1,5 @@
 import { Hyperliquid } from 'hyperliquid';
+import { limitPrice, SLIPPAGE_PCT } from './sizing.js';
 
 const INVO_BUILDER = { address: '0x557edb253b1d7ed5f15b248a5a3fd919fa5d3c81', fee: 35 };
 
@@ -63,14 +64,14 @@ export async function placeMarketOrder(
   coin: string,
   isBuy: boolean,
   size: string,
-  slippagePct = 0.02,
+  slippagePct = SLIPPAGE_PCT,
+  midPx?: number, // reuse the price the size was computed from
 ) {
-  const mids = await getAllMids();
-  const mid = parseFloat(mids[coin]);
+  const mid = midPx ?? parseFloat((await getAllMids())[coin]);
   if (!mid) throw new Error(`No mid price for ${coin}`);
 
-  const rawPx = isBuy ? mid * (1 + slippagePct) : mid * (1 - slippagePct);
-  const limitPx = parseFloat(rawPx.toPrecision(5)).toString();
+  // Same function sizing.ts bounds fills against
+  const limitPx = limitPrice(mid, isBuy, slippagePct).toString();
 
   const s = getSdk();
   return s.exchange.placeOrder({
