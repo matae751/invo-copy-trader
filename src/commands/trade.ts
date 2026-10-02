@@ -4,6 +4,7 @@ import * as hl from '../hl-client.js';
 import { runTrade } from '../trade-exec.js';
 import { FileLedgerStore, defaultLedgerPath } from '../copy-ledger.js';
 import { withFileLock } from '../file-lock.js';
+import { runCommand } from '../run-command.js';
 
 validateEnv();
 if (INVO_TOKEN) invo.setToken(INVO_TOKEN);
@@ -11,8 +12,9 @@ if (INVO_REFRESH_TOKEN) invo.setRefreshToken(INVO_REFRESH_TOKEN);
 
 const ledgerPath = defaultLedgerPath();
 
-// One trade/close at a time: each reads the ledger, trades, then rewrites it
-withFileLock(`${ledgerPath}.lock`, () => runTrade(process.argv.slice(2), {
+// One trade/close at a time: each reads the ledger, trades, then rewrites it.
+// runCommand exits explicitly: the HL SDK leaves a timer running that would keep the process alive.
+runCommand(() => withFileLock(`${ledgerPath}.lock`, () => runTrade(process.argv.slice(2), {
   hl: {
     connect: () => hl.connect(HL_AGENT_KEY, WALLET_ADDRESS),
     getMeta: hl.getMeta,
@@ -24,11 +26,7 @@ withFileLock(`${ledgerPath}.lock`, () => runTrade(process.argv.slice(2), {
   },
   invo,
   ledger: new FileLedgerStore(ledgerPath),
-}))
-  .then(out => {
-    console.log(JSON.stringify(out));
-    // Nothing filled (incl. an order HL rejected), fill unknown, or filled but not recorded:
-    // the copy can't be closed by a signal until fixed
-    if (out.status !== 'filled' || out.ledger.error) process.exitCode = 1;
-  })
-  .catch(e => { console.error(e.message); process.exit(1); });
+})),
+  // Nothing filled (incl. an order HL rejected), fill unknown, or filled but not recorded:
+  // the copy can't be closed by a signal until fixed
+  out => out.status !== 'filled' || !!out.ledger.error);
