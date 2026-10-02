@@ -196,8 +196,8 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   const mid = parseFloat((await hl.getAllMids())[coin]);
   if (!mid) throw new Error(`No mid price for ${coin}`);
 
-  // Size: initial copy → the tier's % of equity, clamped to 5–10% of equity;
-  // increase → the tier's % of equity (≤ 10%), capped at 80% of current notional.
+  // Size: initial copy → the tier's % of equity, clamped to 5–15% of equity;
+  // increase → the tier's % of equity (≤ 15%), capped at 80% of current notional.
   // Bounds hold at the worst-case fill (mid ± SLIPPAGE_PCT), not just at mid.
   const isIncrease = existingSzi !== 0;
   const currentNotionalUsd = Math.abs(existingSzi) * mid;

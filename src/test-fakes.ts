@@ -45,7 +45,7 @@ export const UNIVERSE: HlMeta['universe'] = [
  *   orderFills:   fills HL already holds for cloids (orders from an earlier run)
  *   positionLeverage: leverage of positions held at the start (default 5x isolated);
  *                 setLeverage changes it for the whole coin, as on HL
- *   equity:       account equity in USD (default 784: 10% = $78.40, 5% = $39.20);
+ *   equity:       account equity in USD (default 784: 15% = $117.60, 5% = $39.20);
  *                 `hl.equity` can be changed mid-test
  */
 export function fakeHl(opts: {

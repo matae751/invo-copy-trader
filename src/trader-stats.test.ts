@@ -53,9 +53,9 @@ test('resolved stats drive the existing sizing tiers', async () => {
   const tierFor = async (over: object) =>
     classifyTrader((await getTraderStats(fakeClient({ byId: { [PID]: { success: true, portfolio: fullPortfolio(over) } } }), meta)).stats);
 
-  assert.deepEqual([(await tierFor({})).tier, (await tierFor({})).equityPct], ['strong', 10]);
-  assert.equal((await tierFor({ currentWinStreak: 7 })).equityPct, 7.7);
-  assert.equal((await tierFor({ currentWinStreak: 3 })).equityPct, 6.4);
+  assert.deepEqual([(await tierFor({})).tier, (await tierFor({})).equityPct], ['strong', 15]);
+  assert.equal((await tierFor({ currentWinStreak: 7 })).equityPct, 10.4);
+  assert.equal((await tierFor({ currentWinStreak: 3 })).equityPct, 7.8);
   assert.equal((await tierFor({ currentWinStreak: 0 })).tier, 'poor');
   assert.equal((await tierFor({ liquidated: true })).tier, 'poor');
   assert.equal((await tierFor({ percentChange: -3 })).tier, 'poor');

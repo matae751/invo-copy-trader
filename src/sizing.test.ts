@@ -21,21 +21,21 @@ const strong: TraderStats = {
 
 // --- Tiers ---
 
-test('strong trader aims for 10% of equity', () => {
+test('strong trader aims for 15% of equity', () => {
   const r = classifyTrader(strong);
   assert.equal(r.tier, 'strong');
-  assert.equal(r.equityPct, 10);
+  assert.equal(r.equityPct, 15);
 });
 
-test('average trader aims for 6.4% or 7.7% of equity by streak', () => {
+test('average trader aims for 7.8% or 10.4% of equity by streak', () => {
   assert.deepEqual(
     [classifyTrader({ ...strong, currentWinStreak: 3 }).equityPct, classifyTrader({ ...strong, currentWinStreak: 7 }).equityPct],
-    [6.4, 7.7],
+    [7.8, 10.4],
   );
   // Long streak but win rate / W/L below strong thresholds
   const r = classifyTrader({ ...strong, winRate: 80, wonPositions: 80, lostPositions: 20 });
   assert.equal(r.tier, 'average');
-  assert.equal(r.equityPct, 7.7);
+  assert.equal(r.equityPct, 10.4);
 });
 
 test('strong boundaries are inclusive', () => {
@@ -67,25 +67,37 @@ test('no losses counts as infinite W/L', () => {
   assert.equal(classifyTrader({ ...strong, lostPositions: 0 }).tier, 'strong');
 });
 
-test('every tier percentage lies within the 5%–10% range', () => {
-  assert.deepEqual([MIN_EQUITY_PCT, MAX_EQUITY_PCT], [5, 10]);
+test('every tier percentage lies within the 5%–15% range', () => {
+  assert.deepEqual([MIN_EQUITY_PCT, MAX_EQUITY_PCT], [5, 15]);
   for (const pct of Object.values(TIER_EQUITY_PCT)) assert.ok(pct >= MIN_EQUITY_PCT && pct <= MAX_EQUITY_PCT, String(pct));
-  assert.deepEqual(TIER_EQUITY_PCT, { poor: 5, averageShortStreak: 6.4, averageLongStreak: 7.7, strong: 10 });
+  assert.deepEqual(TIER_EQUITY_PCT, { poor: 5, averageShortStreak: 7.8, averageLongStreak: 10.4, strong: 15 });
+});
+
+test('tiers keep their relative place when the range widened from 5–10% to 5–15%', () => {
+  // Old: poor 5, average 6.4 / 7.7, strong 10 → same fraction of the way from min to max
+  const old = { poor: 5, averageShortStreak: 6.4, averageLongStreak: 7.7, strong: 10 };
+  for (const [tier, pct] of Object.entries(TIER_EQUITY_PCT)) {
+    const oldFraction = (old[tier as keyof typeof old] - 5) / (10 - 5);
+    const newFraction = (pct - MIN_EQUITY_PCT) / (MAX_EQUITY_PCT - MIN_EQUITY_PCT);
+    assert.ok(Math.abs(oldFraction - newFraction) < 1e-9, `${tier}: ${oldFraction} vs ${newFraction}`);
+  }
 });
 
 // --- Equity range ---
 
-test('copyRange is 5%–10% of equity', () => {
-  assert.deepEqual(copyRange(2000), { equityUsd: 2000, minUsd: 100, maxUsd: 200 });
-  assert.deepEqual(copyRange(784), { equityUsd: 784, minUsd: 39.2, maxUsd: 78.4 });
-  // Tier targets at $2,000: poor $100, average $128 / $154, strong $200
-  assert.deepEqual(Object.values(TIER_EQUITY_PCT).map(p => Math.round(tierTargetUsd(2000, p) * 100) / 100), [100, 128, 154, 200]);
+test('copyRange is 5%–15% of equity', () => {
+  assert.deepEqual(copyRange(2000), { equityUsd: 2000, minUsd: 100, maxUsd: 300 });
+  assert.deepEqual(copyRange(784), { equityUsd: 784, minUsd: 39.2, maxUsd: 117.6 });
+  // Tier targets at $2,000: poor $100, average $156 / $208, strong $300
+  assert.deepEqual(Object.values(TIER_EQUITY_PCT).map(p => Math.round(tierTargetUsd(2000, p) * 100) / 100), [100, 156, 208, 300]);
 });
 
-test('below $200 of equity the floor is HL\'s $10 minimum order; below $100 the account is too small', () => {
-  assert.deepEqual(copyRange(150), { equityUsd: 150, minUsd: 10, maxUsd: 15 }); // 5% would be $7.50
-  assert.deepEqual(copyRange(100), { equityUsd: 100, minUsd: 10, maxUsd: 10 });
-  assert.throws(() => copyRange(99.99), /Account equity \$99\.99 is too small to copy: 10% \(\$10\.00\) is below Hyperliquid's \$10 minimum order/);
+test('below $200 of equity the floor is HL\'s $10 minimum order; below $66.67 the account is too small', () => {
+  assert.deepEqual(copyRange(150), { equityUsd: 150, minUsd: 10, maxUsd: 22.5 }); // 5% would be $7.50
+  assert.deepEqual(copyRange(70), { equityUsd: 70, minUsd: 10, maxUsd: 10.5 });
+  assert.equal(copyRange(200 / 3).minUsd, 10); // exactly $66.67: 15% = $10
+  assert.throws(() => copyRange(66.66), /Account equity \$66\.66 is too small to copy: 15% \(\$9\.99\) is below Hyperliquid's \$10 minimum order/);
+  assert.throws(() => copyRange(50), /15% \(\$7\.50\)/);
 });
 
 test('copyRange rejects unusable equity', () => {
@@ -224,7 +236,7 @@ test('initial size refuses when one size step cannot land in the worst-case band
   assert.throws(() => sizeInitial(78.4, BAND, 77.5, 0, true), /too coarse/);
 });
 
-test('initial size stays within 5%–10% of equity at every fill price, for every tier and account size', () => {
+test('initial size stays within 5%–15% of equity at every fill price, for every tier and account size', () => {
   for (const equity of [150, 500, 784, 2000, 10_000, 250_000]) {
     const range = copyRange(equity);
     for (const a of assets) {
@@ -243,18 +255,26 @@ test('initial size stays within 5%–10% of equity at every fill price, for ever
   }
 });
 
+test('just above the minimum account size the range is narrow, and a coarse lot is refused rather than overshot', () => {
+  // $70 equity → $10.00–$10.50. One SOL lot (0.01 @ $142.37) is $1.42, so no qty stays inside at ±2% fills
+  assert.throws(() => sizeInitial(10, copyRange(70), 142.37, 2, true), /Cannot size within \$10\.00-\$10\.50 .* too coarse/);
+  // An asset with finer lots still fits (a $2.35 coin in 0.01 lots)
+  const r = sizeInitial(10, copyRange(70), 2.3456, 2, true);
+  assert.ok(r.minFillNotionalUsd >= 10 && r.maxFillNotionalUsd <= 10.5, JSON.stringify(r));
+});
+
 test('a higher tier never sizes smaller than a lower one', () => {
   const range = copyRange(2000);
   const sizes = Object.values(TIER_EQUITY_PCT).map(p => parseFloat(sizeInitial(tierTargetUsd(2000, p), range, 100, 2, true).qty));
   assert.deepEqual(sizes, [...sizes].sort((x, y) => x - y));
-  // 5% ($100) must hold even at a $98 fill → 1.03; 10% ($200) even at $102 → 1.96
-  assert.deepEqual(sizes, [1.03, 1.28, 1.54, 1.96]);
+  // 5% ($100) must hold even at a $98 fill → 1.03; 15% ($300) even at $102 → 2.94
+  assert.deepEqual(sizes, [1.03, 1.56, 2.08, 2.94]);
 });
 
 test('targets outside the band are clamped to it', () => {
   const range = copyRange(2000);
   assert.equal(sizeInitial(5, range, 100, 2, true).qty, sizeInitial(100, range, 100, 2, true).qty);
-  assert.equal(sizeInitial(10_000, range, 100, 2, true).qty, '1.96');
+  assert.equal(sizeInitial(10_000, range, 100, 2, true).qty, '2.94');
   assert.throws(() => sizeInitial(50, { minUsd: 80, maxUsd: 40 }, 100, 2, true), /Invalid size range/);
 });
 

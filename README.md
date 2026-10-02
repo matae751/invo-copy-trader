@@ -144,9 +144,9 @@ Signal detected: @trader opened SOL long 8x
   │      ├── Asset allowed? (SOL not blocked ✓)
   │      ├── Trader WR ≥ auto-copy threshold? (86% ≥ 80% ✓)
   │      └── Size computed in code (src/sizing.ts) from fresh account equity:
-  │          initial 5-10% of equity by trader tier (poor 5%, average 6.4/7.7%,
-  │          strong 10%; never under HL's $10 minimum, refused under $100 equity);
-  │          increases: tier % (≤ 10%) capped at 80% of current position notional
+  │          initial 5-15% of equity by trader tier (poor 5%, average 7.8/10.4%,
+  │          strong 15%; never under HL's $10 minimum, refused under $66.67 equity);
+  │          increases: tier % (≤ 15%) capped at 80% of current position notional
   │
   ├── 2. Execute on Hyperliquid
   │      ├── Set leverage (8x isolated)

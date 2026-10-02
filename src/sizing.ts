@@ -3,13 +3,13 @@
 // Sizes follow the account: percentages of the current Hyperliquid account
 // equity (marginSummary.accountValue), read fresh before each copy.
 //
-// Initial copy:  USD notional between 5% and 10% of equity (copyRange). The
+// Initial copy:  USD notional between 5% and 15% of equity (copyRange). The
 //                copied trader's performance tier picks the percentage: poor 5%,
-//                average 6.4% (streak < 5) or 7.7% (streak >= 5), strong 10%.
+//                average 7.8% (streak < 5) or 10.4% (streak >= 5), strong 15%.
 //                The floor is never below Hyperliquid's $10 minimum order, so
-//                under $200 of equity it is $10 rather than 5%; under $100 the
-//                account is too small to copy at all.
-// Increase:      the tier's % of equity (at most 10%), capped at 80% of the
+//                under $200 of equity it is $10 rather than 5%; under $66.67
+//                (15% < $10) the account is too small to copy at all.
+// Increase:      the tier's % of equity (at most 15%), capped at 80% of the
 //                current USD notional of our position (valued at mid). No 5%
 //                floor (the 80% cap can be smaller); $10 minimum. No cap on
 //                total position size.
@@ -25,13 +25,17 @@
 
 /** A copy's size range, as % of account equity. */
 export const MIN_EQUITY_PCT = 5;
-export const MAX_EQUITY_PCT = 10;
-/** % of equity each tier aims for, within [MIN_EQUITY_PCT, MAX_EQUITY_PCT]. */
+export const MAX_EQUITY_PCT = 15;
+/**
+ * % of equity each tier aims for, within [MIN_EQUITY_PCT, MAX_EQUITY_PCT]. Each
+ * tier keeps its relative place in the range (average: 28% and 54% of the way
+ * from the minimum to the maximum; poor at the minimum, strong at the maximum).
+ */
 export const TIER_EQUITY_PCT = {
   poor: 5,
-  averageShortStreak: 6.4, // streak < 5
-  averageLongStreak: 7.7, // streak >= 5
-  strong: 10,
+  averageShortStreak: 7.8, // streak < 5
+  averageLongStreak: 10.4, // streak >= 5
+  strong: 15,
 } as const;
 export const MAX_INCREASE_FRACTION = 0.8;
 export const MIN_ORDER_NOTIONAL_USD = 10; // Hyperliquid minimum order value
@@ -96,18 +100,19 @@ export interface CopyRange {
   equityUsd: number;
   /** 5% of equity, or Hyperliquid's $10 minimum order if that is more. */
   minUsd: number;
-  /** 10% of equity. */
+  /** 15% of equity. */
   maxUsd: number;
 }
 
-/** Throws if equity is unusable, or too small for a copy (10% below the $10 minimum order). */
+/** Throws if equity is unusable, or too small for a copy (15% below the $10 minimum order). */
 export function copyRange(equityUsd: number): CopyRange {
   if (!Number.isFinite(equityUsd) || !(equityUsd > 0)) throw new Error(`Invalid account equity: ${equityUsd}`);
   const maxUsd = (equityUsd * MAX_EQUITY_PCT) / 100;
   const minUsd = Math.max((equityUsd * MIN_EQUITY_PCT) / 100, MIN_ORDER_NOTIONAL_USD);
   if (minUsd > maxUsd) {
     throw new Error(
-      `Account equity $${equityUsd.toFixed(2)} is too small to copy: ${MAX_EQUITY_PCT}% ($${maxUsd.toFixed(2)}) ` +
+      // Cents rounded down, so 15% of $66.66 shows as $9.99, not a misleading "$10.00"
+      `Account equity $${equityUsd.toFixed(2)} is too small to copy: ${MAX_EQUITY_PCT}% ($${(Math.floor(maxUsd * 100) / 100).toFixed(2)}) ` +
       `is below Hyperliquid's $${MIN_ORDER_NOTIONAL_USD} minimum order`,
     );
   }
@@ -225,7 +230,7 @@ export interface IncreaseResult extends SizeResult {
 /**
  * Size an add to an existing position: min(targetUsd, 80% of current notional),
  * with the worst-case fill held under that amount. Rounded down. targetUsd is the
- * tier's % of equity, at most 10% of it (see trade-exec).
+ * tier's % of equity, at most 15% of it (see trade-exec).
  */
 export function sizeIncrease(
   targetUsd: number,

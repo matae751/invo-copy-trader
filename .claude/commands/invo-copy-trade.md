@@ -167,7 +167,7 @@ This runs **10 automated checks**:
 ║              [4] FULL DEGEN                                          ║
 ║                                                                      ║
 ║  Max Leverage:        20x        (skip trades above this)            ║
-║  Position Size:       AUTO       (5-10% of equity by trader perf.)   ║
+║  Position Size:       AUTO       (5-15% of equity by trader perf.)   ║
 ║  Blocked Assets:      none       (comma-separated, or 'none')       ║
 ║  Only Assets:         any        (restrict to specific coins)        ║
 ║                                                                      ║
@@ -199,7 +199,7 @@ Once confirmed, show:
 ║  ✓ CRITERIA LOCKED IN                                               ║
 ║  Traders:  [summary of discovery filters]                           ║
 ║  Auto-Copy: [ON/OFF] for traders with ≥ [X]% win rate              ║
-║  Risk Mode: [NAME] — Max [X]x lev | size 5-10% of equity (auto)    ║
+║  Risk Mode: [NAME] — Max [X]x lev | size 5-15% of equity (auto)    ║
 ║  Exit:     Mirror trader closes (no independent TP/SL)              ║
 ║  Actions:  Copy opens ✓  closes ✓  increases (ask) ✓               ║
 ║  >> Proceeding to trader discovery...                                ║
@@ -406,7 +406,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts > ~/invo-copy-trader/mo
 2. Asset choice (stick to liquid assets: SOL, BTC, ETH, XRP, DOGE)
 3. Leverage level (>10x = higher risk, narrate the tradeoff)
 4. Current streak (hot hand = higher conviction)
-5. Account balance — a copy is 5-10% of account equity; make sure available (unused) margin covers that at the trade's leverage, or Hyperliquid rejects the order
+5. Account balance — a copy is 5-15% of account equity; make sure available (unused) margin covers that at the trade's leverage, or Hyperliquid rejects the order
 
 ---
 
@@ -422,16 +422,16 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
 - `long|short`: direction
 - `size`: **ignored** — pass `auto`. The position size is computed in `src/sizing.ts` and cannot be overridden from the command line:
   - **Account equity** is read fresh from Hyperliquid (`clearinghouseState` → `marginSummary.accountValue`, which includes unrealized P&L) immediately before sizing every trade, so sizes track the current balance.
-  - **Initial copy** (no open position in that coin): USD notional between **5% and 10% of equity**. The copied trader's stats (fetched by `mimicMeta.portfolioId` / `creatorInvoUserId`) pick the percentage:
-    - STRONG (10%): win streak ≥ 10, win rate ≥ 85%, W/L ≥ 5
-    - AVERAGE (7.7% if streak 5-9, else 6.4%)
+  - **Initial copy** (no open position in that coin): USD notional between **5% and 15% of equity**. The copied trader's stats (fetched by `mimicMeta.portfolioId` / `creatorInvoUserId`) pick the percentage:
+    - STRONG (15%): win streak ≥ 10, win rate ≥ 85%, W/L ≥ 5
+    - AVERAGE (10.4% if streak 5-9, else 7.8%)
     - POOR (5%): stats unavailable, P&L ≤ 0, liquidated, streak 0, win rate < 60%, or W/L < 1.5
-    - E.g. equity $2,000 → poor $100, average $128 / $154, strong $200.
-    - The floor is never below Hyperliquid's $10 minimum order: under $200 of equity it is $10, not 5%. Under $100 of equity (10% < $10) `trade.ts` refuses: `Account equity $… is too small to copy`.
-  - **Increase** (open position in the same direction): the tier's % of equity (at most 10%), capped at 80% of the position's current USD notional; no 5% floor (the 80% cap can be smaller), $10 minimum. No cap on total position size. Only run an increase for an `update` signal the user confirmed was an add (see "When notified of a signal").
+    - E.g. equity $2,000 → poor $100, average $156 / $208, strong $300.
+    - The floor is never below Hyperliquid's $10 minimum order: under $200 of equity it is $10, not 5%. Under $66.67 of equity (15% < $10) `trade.ts` refuses: `Account equity $… is too small to copy`. Just above that the range is narrow (e.g. $70 → $10.00–$10.50), and a coin whose lot is too coarse to land in it is refused as "too coarse" rather than overshot.
+  - **Increase** (open position in the same direction): the tier's % of equity (at most 15%), capped at 80% of the position's current USD notional; no 5% floor (the 80% cap can be smaller), $10 minimum. No cap on total position size. Only run an increase for an `update` signal the user confirmed was an add (see "When notified of a signal").
   - A position in the opposite direction makes `trade.ts` refuse the trade.
   - USD is converted to coin units with the current mid price and the asset's szDecimals.
-  - All limits hold at the **worst-case fill**, not just at mid: the order is an IOC limit at mid ± 2%, so size is chosen so any fill in that range stays within 5-10% of equity (initial) or under the 80% cap (increase). E.g. with $2,000 equity at mid $100, a strong copy is 1.96 coins (≤ $200 even at a $102 fill) and a poor one 1.03 (≥ $100 even at $98).
+  - All limits hold at the **worst-case fill**, not just at mid: the order is an IOC limit at mid ± 2%, so size is chosen so any fill in that range stays within 5-15% of equity (initial) or under the 80% cap (increase). E.g. with $2,000 equity at mid $100, a strong copy is 2.94 coins (≤ $300 even at a $102 fill) and a poor one 1.03 (≥ $100 even at $98).
 - `leverage`: **required**, a whole number from 1 up to the asset's Hyperliquid max (SOL: 20x, BTC: 40x). `trade.ts` refuses anything else, including a value above that max, before setting leverage or placing an order.
   - **Leverage is per coin on Hyperliquid** — one value for the whole position, other copies included. When we already hold the coin, the leverage must equal the existing position's (isolated); otherwise `trade.ts` refuses before changing anything: `Refusing 20x on SOL: the existing SOL position is 3x isolated … Re-run with 3`. Re-run at the existing leverage only if the user agrees. A cross position, or one whose leverage can't be read, is refused the same way.
 - `mimicMetaJson`: **required.** Pass the signal's `mimicMeta` unchanged. `trade.ts` checks it before placing any order. It refuses if the argument is missing, is not JSON, has a missing field, or uses the old `{baseId, baseShortId}` shape. It never makes up IDs.
@@ -462,19 +462,19 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
   "status": "filled",
   "coin": "SOL",
   "side": "long",
-  "size": "1.26",
+  "size": "1.53",
   "leverage": 5,
   "sizing": {
     "mode": "initial",
     "tier": "average",
     "equityUsd": 2000,
-    "tierPct": 6.4,
+    "tierPct": 7.8,
     "minUsd": 100,
-    "maxUsd": 200,
-    "targetUsd": 128,
-    "notionalUsd": 128.18,
-    "minFillNotionalUsd": 125.61,
-    "maxFillNotionalUsd": 130.75,
+    "maxUsd": 300,
+    "targetUsd": 156,
+    "notionalUsd": 155.65,
+    "minFillNotionalUsd": 152.53,
+    "maxFillNotionalUsd": 158.76,
     "mid": 101.73,
     "limitPx": 103.76,
     "reasons": ["streak 3, WR 88%, W/L 6.10, P&L 900%"],
@@ -483,11 +483,11 @@ cd ~/invo-copy-trader && npx tsx src/commands/trade.ts <coin> <long|short> auto 
   "manual": false,
   "sourceBaseShortId": "aB3xY9_kLm",
   "positionRecordId": "uuid",
-  "filledQty": 1.26,
-  "ledger": { "entryId": "uuid", "copyQty": 1.26 },
+  "filledQty": 1.53,
+  "ledger": { "entryId": "uuid", "copyQty": 1.53 },
   "clientTxId": "uuid",
   "qtyBefore": "0",
-  "qtyAfter": "1.26",
+  "qtyAfter": "1.53",
   "hlResult": { ... },
   "invoResult": { ... }
 }
