@@ -2,7 +2,8 @@ import { randomUUID, randomBytes } from 'crypto';
 import { validateEnv, INVO_TOKEN, INVO_REFRESH_TOKEN, HL_AGENT_KEY, WALLET_ADDRESS } from '../env.js';
 import * as invo from '../invo-client.js';
 import * as hl from '../hl-client.js';
-import { classifyTrader, sizeInitial, sizeIncrease, SLIPPAGE_PCT, type TraderStats } from '../sizing.js';
+import { classifyTrader, sizeInitial, sizeIncrease, SLIPPAGE_PCT } from '../sizing.js';
+import { getTraderStats } from '../trader-stats.js';
 
 validateEnv();
 if (INVO_TOKEN) invo.setToken(INVO_TOKEN);
@@ -14,18 +15,6 @@ function genBaseShortId(): string {
   let id = '';
   for (const b of bytes) id += chars[b % chars.length];
   return id;
-}
-
-// Look up the copied trader's portfolio stats (same endpoint discover.ts uses).
-// Returns null on any failure — classifyTrader treats that as the poor tier ($40).
-async function fetchTraderStats(mimicMeta: any): Promise<TraderStats | null> {
-  if (!mimicMeta?.creatorInvoUserId || !mimicMeta?.portfolioId) return null;
-  try {
-    const data = await invo.discoverTraders('user', 1, 50, mimicMeta.creatorInvoUserId);
-    return (data.items ?? []).find((p: any) => p.id === mimicMeta.portfolioId) ?? null;
-  } catch {
-    return null;
-  }
 }
 
 async function main() {
@@ -64,7 +53,9 @@ async function main() {
 
   // Size: initial copy → $40-$78.40 by tier; increase → tier target capped at 80% of current notional.
   // Bounds hold at the worst-case fill (mid ± SLIPPAGE_PCT), not just at mid.
-  const perf = classifyTrader(await fetchTraderStats(mimicMetaArg));
+  // Stats null on any lookup failure → poor tier ($40)
+  const statsLookup = await getTraderStats(invo, mimicMetaArg);
+  const perf = classifyTrader(statsLookup.stats);
   const isIncrease = existingSzi !== 0;
   const currentNotionalUsd = Math.abs(existingSzi) * mid;
   const sizing = isIncrease
@@ -143,6 +134,7 @@ async function main() {
       limitPx: sizing.limitPx,
       ...('capUsd' in sizing && { currentNotionalUsd: Math.round(currentNotionalUsd * 100) / 100, capUsd: sizing.capUsd }),
       reasons: perf.reasons,
+      statsLookup: statsLookup.status,
       ignoredSizeArg: ignoredSizeArg ?? null,
     },
     baseShortId,

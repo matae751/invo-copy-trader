@@ -94,15 +94,17 @@ All commands run via `npx tsx src/commands/<cmd>.ts`.
 | `verify.ts` | Endpoint health check (8 endpoints) | `npx tsx src/commands/verify.ts` |
 | `discover.ts` | Scan & rank top traders | `npx tsx src/commands/discover.ts` |
 | `follow.ts` | Follow/unfollow traders | `npx tsx src/commands/follow.ts follow <userId>` |
-| `monitor.ts` | Real-time signal monitor | `npx tsx src/commands/monitor.ts '["portfolioId"]'` |
-| `monitor.ts` | Feed + trade polling | `npx tsx src/commands/monitor.ts '["pId"]' '[{"baseShortId":"x","mimicStartedAt":"..."}]'` |
-| `monitor.ts` | Wait-for-signal mode | `npx tsx src/commands/monitor.ts --wait-for-signal '["id"]'` |
+| `monitor.ts` | Real-time signal monitor (your Invo following list) | `npx tsx src/commands/monitor.ts` |
+| `monitor.ts` | Feed + trade polling | `npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"..."}]'` |
+| `monitor.ts` | Wait-for-signal mode | `npx tsx src/commands/monitor.ts --wait-for-signal` |
 | `trade.ts` | Open a position | `npx tsx src/commands/trade.ts SOL long 0.14 5` |
 | `close.ts` | Close a position | `npx tsx src/commands/close.ts SOL [baseShortId]` |
 
 ## Signal Detection
 
-The monitor watches the Invo social feed for verified trade signals from followed traders. Each signal contains:
+The monitor copies **only the traders your Invo account currently follows**. At startup it loads your following list (`POST /v1_0/users/get_following`) and resolves each trader's portfolios (`POST /v1_0/portfolios/v2/get_users_portfolios`), then re-fetches the list every 60s (`--refresh=<sec>`, min 10) and on demand when the feed shows an unknown trader. Follow or unfollow people in the Invo app — the monitor picks it up on the next refresh or restart and prints a `following_changed` line. It never follows or unfollows anyone itself, and exits if the following list can't be loaded at startup.
+
+A feed post becomes a `signal` only if it's a verified trade (`verifiedTrade: true`), not a repost, its owner is in the current following list, and its portfolio belongs to that trader. Other trade posts are logged to stderr as `{"type":"skipped","reason":...}`. Each signal contains:
 
 ```
 Feed post (postTypeId: "investment" | "update")
@@ -208,6 +210,9 @@ POST /v1_0/trending/get_users           → Trending users
 POST /v1_0/posts/get_feed               → Social feed (filters: trending, following, all)
 POST /v1_0/users/follow                 → Follow user
 POST /v1_0/users/unfollow               → Unfollow user
+GET  /v1_0/users/get_user               → Current user (id)
+POST /v1_0/users/get_following          → Users you follow {userId, query, params: {page, size}}
+POST /v1_0/portfolios/v2/get_users_portfolios → A user's portfolios {userId, params: {isDeleted, page, size}}
 POST /dex/account/ready                 → Account readiness check
 POST /dex/trade                         → Trade status polling
 POST /dex/position/create               → Record open in Invo wallet

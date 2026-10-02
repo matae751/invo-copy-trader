@@ -33,9 +33,9 @@ You (Claude) ── reasoning + UI ── agentic decision loop
   │
   ├── src/commands/preflight.ts → full pre-flight check (10 checks)
   ├── src/commands/verify.ts    → system health check (8 endpoints)
-  ├── src/commands/discover.ts  → scan & rank 100+ traders
-  ├── src/commands/follow.ts    → social graph management
-  ├── src/commands/monitor.ts   → real-time signal detection (background)
+  ├── src/commands/discover.ts  → scan & rank 100+ traders (informational only)
+  ├── src/commands/follow.ts    → social graph management (ONLY when the user explicitly asks)
+  ├── src/commands/monitor.ts   → real-time signal detection from the account's Invo following list (background)
   ├── src/commands/trade.ts     → open position (HL exchange + Invo wallet)
   └── src/commands/close.ts     → close position (HL exchange + Invo wallet)
       │
@@ -151,7 +151,6 @@ This runs **10 automated checks**:
 ║  Min Win Rate:        75%        (consistency gate)                  ║
 ║  Min P&L:             500%       (lifetime % return)                 ║
 ║  Min Win/Loss Ratio:  3.0        (risk discipline)                   ║
-║  Max Traders:         25         (follow up to N traders)            ║
 ║                                                                      ║
 ║  COPY BEHAVIOR                                                       ║
 ║  ─────────────────────────────────────────────────────────────      ║
@@ -209,10 +208,13 @@ Once confirmed, show:
 
 **Use these locked-in criteria throughout all subsequent phases.** Discovery filters apply to `discover.ts` output filtering. Risk settings apply when evaluating and executing trades in Phases 4-5.
 
+**Which traders get copied is decided by the user, not you:** the monitor copies exactly the users the Invo account currently follows. Never follow, unfollow, or pick traders on your own.
+
 ---
 
-## PHASE 1: DISCOVER & ANALYZE TRADERS
+## PHASE 1 (OPTIONAL): DISCOVER & ANALYZE TRADERS
 > **CLI ONLY** — run the command below. Do NOT use browser tools.
+> **Informational only.** Run it only if the user asks for trader research. Its results never change who is copied — present them so the user can decide whom to follow in the Invo app.
 
 ```bash
 cd ~/invo-copy-trader && npx tsx src/commands/discover.ts
@@ -261,69 +263,62 @@ cd ~/invo-copy-trader && npx tsx src/commands/discover.ts
 - Who has the longest active streak? (Momentum signal)
 - Who has high P&L with low loss count? (Disciplined risk management)
 - Any red flags? (e.g., high win rate but few total trades = small sample)
-- Announce your top picks and WHY.
+- Point out notable traders and WHY — as suggestions the user may act on in the Invo app, not picks you act on.
 
 ---
 
-## PHASE 2: FOLLOW SELECTED TRADERS
-> **CLI ONLY** — run the command below. Do NOT use browser tools.
+## PHASE 2: FOLLOWED TRADERS (managed by the user)
 
-```bash
-cd ~/invo-copy-trader && npx tsx src/commands/follow.ts follow <ownerId1> <ownerId2> ...
-```
+**Do NOT run `follow.ts` automatically.** The user follows and unfollows traders themselves in the Invo app; that following list is the copy list. Only run `follow.ts` if the user explicitly tells you to follow/unfollow specific users in this conversation.
 
-To unfollow:
-```bash
-cd ~/invo-copy-trader && npx tsx src/commands/follow.ts unfollow <ownerId1> ...
-```
+The monitor (Phase 3) loads the list itself — `GET /v1_0/users/get_user` → `POST /v1_0/users/get_following` → each trader's portfolios via `POST /v1_0/portfolios/v2/get_users_portfolios` — and prints it as a `following_loaded` line. Show it:
 
-**Output**: JSON with `action` and `results[]` (status per user).
-
-**Show follow panel:**
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
-║  SOCIAL GRAPH UPDATED                                               ║
+║  COPYING YOUR INVO FOLLOWING LIST ({N} traders)                     ║
 ║  ┌──────────────────────────────────────────────────────────────┐   ║
-║  │  ✓ @trader1 (score: 1598) — followed                        │   ║
-║  │  ✓ @trader2 (score: 1136) — followed                        │   ║
-║  │  ✓ @trader3 (score: 712)  — followed                        │   ║
+║  │  @trader1 — 3 portfolios                                     │   ║
+║  │  @trader2 — 1 portfolio                                      │   ║
 ║  └──────────────────────────────────────────────────────────────┘   ║
-║  Now monitoring their feed for trade signals...                     ║
+║  Follow/unfollow in the Invo app — picked up within ~60s.           ║
 ╚══════════════════════════════════════════════════════════════════════╝
 ```
+
+If the list is empty, tell the user to follow traders in the Invo app; there is nothing to copy until they do.
 
 ---
 
 ## PHASE 3: MONITOR FOR TRADE SIGNALS
 > **CLI ONLY** — run the command below. Do NOT use browser tools.
 
-Start the monitor as a **background process**:
+Start the monitor as a **background process**. No trader or portfolio IDs are needed — it copies the account's current Invo following list:
 
 ```bash
-cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '["portfolioId1","portfolioId2"]'
+cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts
 ```
 
-Or with watch entries for active mimic positions:
+With watch entries for active mimic positions (feed + trade polling — recommended when you have open positions):
 ```bash
-cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"2024-01-01T00:00:00Z"}]'
+cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"..."}]'
 ```
 
-Or **both simultaneously** (feed + trade polling — recommended when you have open positions):
-```bash
-cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '["portfolioId1","portfolioId2"]' '[{"baseShortId":"x","mimicStartedAt":"..."}]'
-```
-
-**IMPORTANT: The monitor accepts multiple JSON array arguments.** String arrays are treated as portfolio IDs (feed polling), object arrays with `baseShortId` are treated as watch entries (trade polling). Pass both to get both modes at once.
+Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignored with a notice.
 
 **How it works:**
+- Loads the following list at startup; **exits with an error if it can't** (never copies anyone unverified)
+- Re-fetches the following list every 60s (`--refresh=<sec>`, min 10), and on demand (rate-limited) when the feed shows an unknown trader or portfolio. Follows/unfollows made in the Invo app take effect on the next refresh or restart. A failed refresh keeps the last list.
 - Polls `POST /dex/trade` every 5 seconds (trade status updates) — only when watch entries provided
 - Polls `POST /v1_0/posts/get_feed` (filter: `following`) every 5 seconds (new signals)
+- A post is a signal only if: `verifiedTrade: true`, not a repost, owner is in the current following list, and the portfolio belongs to that trader
 - Deduplicates by post ID / update key
-- Outputs JSON lines to stdout:
-  - `{"type":"started",...}` — initial status
-  - `{"type":"signal",...}` — a followed trader opened/closed a trade
-  - `{"type":"trade_update",...}` — status update on watched position
-  - `{"type":"error",...}` — non-fatal error (logged to stderr)
+- Outputs JSON lines:
+  - `{"type":"started",...}` — initial status (stdout)
+  - `{"type":"following_loaded","traders":[...]}` — followed traders + portfolio IDs (stdout)
+  - `{"type":"following_changed","added":[...],"removed":[...]}` — list changed on Invo (stdout; does NOT end `--wait-for-signal`)
+  - `{"type":"signal",...}` — a followed trader opened/closed/increased a verified trade (stdout)
+  - `{"type":"trade_update",...}` — status update on watched position (stdout)
+  - `{"type":"skipped","reason":...}` — trade post rejected by the filter (stderr)
+  - `{"type":"error",...}` — non-fatal error (stderr)
 
 **Signal object shape:**
 ```json
@@ -331,16 +326,12 @@ cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '["portfolioId1","portf
   "type": "signal",
   "poll": 42,
   "postId": "uuid",
+  "action": "open",
   "owner": { "id": "uuid", "username": "trader1" },
-  "trade": {
-    "action": "open",
-    "coin": "SOL",
-    "side": "long",
-    "leverage": 5,
-    "size": "2.5",
-    "price": "142.50",
-    "portfolioId": "uuid"
-  }
+  "followed": { "userId": "uuid", "username": "trader1" },
+  "trade": { "coin": "SOL", "name": "...", "side": "long", "leverage": 5, "entryPrice": 142.5, "closingPrice": null, "entrySize": 2.5, "isOpen": true },
+  "portfolio": { "id": "uuid", "title": "...", "winRate": 91.2, "closedPositions": 140, "openPositions": 2, "pnl": 1234 },
+  "mimicMeta": { "portfolioId": "uuid", "creatorInvoUserId": "uuid", "baseId": "uuid", "baseShortId": "aB3xY9_kLm" }
 }
 ```
 
@@ -348,10 +339,10 @@ cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '["portfolioId1","portf
 
 ```bash
 # Feed only (no open positions)
-cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal '["portfolioId1","portfolioId2"]'
+cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal
 
 # Feed + trade polling (when you have open positions to watch)
-cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal '["portfolioId1","portfolioId2"]' '[{"baseShortId":"x","mimicStartedAt":"..."}]'
+cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal '[{"baseShortId":"x","mimicStartedAt":"..."}]'
 ```
 
 **How it works:**
@@ -374,7 +365,7 @@ cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts --wait-for-signal '["po
 
 **Alternative: continuous mode** (without `--wait-for-signal`) runs forever and prints all signals. Use this if you want to `tail` a log file manually:
 ```bash
-cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts '["portfolioId1"]' > ~/invo-copy-trader/monitor-output.log 2>&1 &
+cd ~/invo-copy-trader && npx tsx src/commands/monitor.ts > ~/invo-copy-trader/monitor-output.log 2>&1 &
 ```
 
 **When a signal arrives, show:**
@@ -543,12 +534,9 @@ You are not a passive executor — you are an **autonomous trading agent**. Make
 
 ### Decision Framework
 
-1. **Discovery phase**: Always run discover first. Analyze the full leaderboard before picking targets. Don't just pick the top score — consider diversification (different trading styles), consistency (streak vs. total), and risk profile (leverage habits).
+1. **Discovery phase (optional)**: Only on request. Analyze the leaderboard and suggest traders — diversification, consistency, risk profile — but the user decides whom to follow.
 
-2. **Follow strategically**: Follow all traders that pass discovery filters (up to the configured max). More traders = more signals = more opportunities. Prefer traders with:
-   - Active streaks (momentum)
-   - High W/L ratio (risk management discipline)
-   - Reasonable leverage (1-10x = sustainable)
+2. **Never manage the follow list**: Do not follow, unfollow, or select traders yourself. The copy list is the Invo account's following list, maintained by the user in the Invo app. Only signals from those traders reach you.
 
 3. **Signal evaluation**: Not every signal should be copied. Consider:
    - Is this a liquid asset? (SOL, BTC, ETH = yes. Random microcaps = skip)
@@ -600,6 +588,9 @@ All requests use `POST` with `Authorization: Bearer <jwt>`, `Content-Type: appli
 | `POST /v1_0/posts/get_feed` | Social feed | `{filter: {filter, assetTypes: []}, params: {lastPostId, itemLimit}}` |
 | `POST /v1_0/users/follow` | Follow user | `{objectId: userId}` |
 | `POST /v1_0/users/unfollow` | Unfollow user | `{objectId: userId}` |
+| `GET /v1_0/users/get_user` | Current user | — → `{user: {id, username, followingCount, ...}}` |
+| `POST /v1_0/users/get_following` | Users the account follows | `{userId, query: null, params: {page, size: 20}}` → `{page, size, success, error, following: [{id, username, isPending, ...}]}` |
+| `POST /v1_0/portfolios/v2/get_users_portfolios` | A user's portfolios | `{userId, params: {isDeleted: false, page, size: 20}}` → `{portfolios: [{id, ownerId, title, winRate, ...}]}` |
 | `POST /dex/account/ready` | Check trading status | `{}` |
 | `POST /dex/trade` | Poll trade updates | `{investments: [{baseShortId, mimicStartedAt}]}` — **use the TRADER's baseShortId from the signal, NOT your client-generated one** |
 | `POST /dex/position/create` | Record open in Invo wallet | Full payload (see RecordOpenPayload) |
@@ -608,7 +599,7 @@ All requests use `POST` with `Authorization: Bearer <jwt>`, `Content-Type: appli
 
 **Quirks:**
 - Some responses are base64-encoded JSON (client auto-decodes)
-- `filter` values for discover: `trending`, `all`, `user` (with userId param)
+- `filter` values for discover: `trending`, `all`, `user` — note `get_portfolios_pl` **ignores a top-level `userId`** (returns other owners' portfolios); use `get_users_portfolios` to list one user's portfolios
 - `filter` values for feed: `trending`, `following`, `all`
 - `page` is nested inside `params`, NOT top-level (causes 500 if wrong)
 - `mimicMeta` requires 4 UUID-format strings — random UUIDs are accepted
@@ -652,14 +643,14 @@ The `hyperliquid` npm SDK (v1.7.7) handles all exchange operations:
 Run the phases sequentially. Each phase builds on the previous one.
 
 1. **Boot**: Run `verify.ts`. Confirm all 8 subsystems are green. If any fail, diagnose before proceeding.
-2. **Discover**: Run `discover.ts`. Analyze the full leaderboard. Narrate your reasoning on each top trader — win rate, P&L consistency, W/L ratio, streak momentum, risk profile.
-3. **Follow**: Run `follow.ts` for your selected traders (2-4 max). Announce selections and rationale.
-4. **Monitor**: Start `monitor.ts` in background with the followed traders' portfolio IDs. Read output periodically for signals.
+2. **Discover (optional)**: Only if the user asks — run `discover.ts` and present suggestions. Do not act on them.
+3. **Followed traders**: Nothing to run — the user follows/unfollows in the Invo app. Never call `follow.ts` unless explicitly asked.
+4. **Monitor**: Start `monitor.ts` in background (no ID arguments). Show the `following_loaded` list, then react to signals.
 5. **Trade**: When a signal arrives (or on manual decision), evaluate it against the decision framework, then execute via `trade.ts`. Record the `baseShortId`.
 6. **Manage**: Continue monitoring. Track open positions, entry prices, and P&L. React to close signals or hit your exit criteria.
 7. **Close**: Exit positions via `close.ts` when the copied trader exits, your take-profit/stop-loss hits, or market conditions change.
 
-The agent can loop phases 4-7 indefinitely — discover and follow are one-time setup, while monitor/trade/close is the continuous operational loop.
+The agent can loop phases 4-7 indefinitely. Changes to the Invo following list are picked up by the running monitor automatically.
 
 ---
 ---

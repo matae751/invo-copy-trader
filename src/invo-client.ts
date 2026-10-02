@@ -113,6 +113,37 @@ export async function getFeed(filter: string, lastPostId: string | null = null, 
 
 // --- Social ---
 
+/** The authenticated user. Response: { success, error, user: { id, username, followingCount, ... } } */
+export async function getCurrentUser() {
+  return get('/v1_0/users/get_user');
+}
+
+/**
+ * Users that `userId` follows (read-only). Same request the Invo web app sends.
+ * Response: { page, size, success, error, following: [{ id, username, name, isFollowing, ... }] }
+ */
+export async function getFollowing(userId: string, page = 1, size = 20) {
+  return post('/v1_0/users/get_following', { userId, query: null, params: { page, size } });
+}
+
+/**
+ * Portfolios owned by `userId` (read-only). Same request the Invo web app sends.
+ * Response: { portfolios: [{ id, ownerId, title, winRate, closedPositions, ... }] }
+ * Note: get_portfolios_pl ignores a top-level userId, so it can't be used for this.
+ */
+export async function getUserPortfolios(userId: string, page = 1, size = 20) {
+  return post('/v1_0/portfolios/v2/get_users_portfolios', { userId, params: { isDeleted: false, page, size } });
+}
+
+/**
+ * One portfolio with full stats (read-only). Same request the Invo web app sends.
+ * Response: { success, error, portfolio: { id, ownerId, winRate, wonPositions, lostPositions,
+ *   currentWinStreak, percentChange, liquidated, ... } }
+ */
+export async function getPortfolioById(portfolioId: string) {
+  return post('/v1_0/portfolios/get_portfolio_by_id', { portfolioId });
+}
+
 export async function followUser(userId: string) {
   return post('/v1_0/users/follow', { objectId: userId });
 }
