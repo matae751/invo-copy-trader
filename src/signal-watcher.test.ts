@@ -40,19 +40,48 @@ function post(owner: string, trade: string, kind: 'open' | 'update' | 'close' = 
       portfolio: { id: `p-${owner}` },
       isOpen: kind !== 'close',
       closingPrice: kind === 'close' ? 150 : null,
-      changes: { isAdded: kind === 'open' },
+      // Live shapes (2026-10-02): changes holds the previous values of what changed.
+      // A new trade is exactly { isAdded: false }; a close { isOpen: true, reasonClosed: null }.
+      // An update's shape hasn't been seen live; any other changes object is an ambiguous update.
+      changes: kind === 'open' ? { isAdded: false } : kind === 'close' ? { isOpen: true, reasonClosed: null } : { entrySize: 2.5 },
       ...extra.update,
     },
+  };
+}
+
+/**
+ * A /dex/trade entry in the live shape (captured 2026-10-02) for `owner`'s trade `trade`.
+ * There is no isOpen: a close is an update with updateType "close".
+ */
+function dexTrade(owner: string, trade: string, updates: { updateType: string; updatedAt?: string; investmentId?: string; details?: object }[]) {
+  return {
+    creatorAppUserId: owner,
+    portfolioId: `p-${owner}`,
+    investmentBaseId: `base-${trade}`,
+    investmentBaseShortId: `short-${trade}`,
+    unmimickedCount: updates.length,
+    unseenCount: updates.length,
+    updates: updates.map((u, i) => ({
+      investmentId: u.investmentId ?? `inv-${trade}-${i}`,
+      investmentBaseId: `base-${trade}`,
+      isSeen: false,
+      updatedAt: u.updatedAt ?? '2026-10-02T14:31:15.806Z',
+      updateType: u.updateType,
+      isMimicked: false,
+      details: u.details ?? {},
+    })),
   };
 }
 
 /** Feed newest-first; `lastPostId` pages to older posts (or is ignored, like a broken cursor). */
 function fakeInvo(opts: { ignoreCursor?: boolean } = {}) {
   const feed: any[] = [];
-  const tradeItems: any[] = [];
+  /** /dex/trade `data` entries (see dexTrade); `rawTradeResponse` replaces the whole response. */
+  const trades: any[] = [];
   const calls = { getFeed: [] as (string | null)[], getTradeUpdates: [] as WatchEntry[][] };
   return {
-    feed, tradeItems, calls,
+    feed, trades, calls,
+    rawTradeResponse: undefined as unknown,
     publish(...posts: any[]) { feed.unshift(...posts.reverse()); },
     async getFeed(_filter: string, lastPostId: string | null, itemLimit: number) {
       calls.getFeed.push(lastPostId);
@@ -61,7 +90,7 @@ function fakeInvo(opts: { ignoreCursor?: boolean } = {}) {
     },
     async getTradeUpdates(investments: WatchEntry[]) {
       calls.getTradeUpdates.push(investments);
-      return { investments: tradeItems };
+      return this.rawTradeResponse ?? { success: true, data: trades };
     },
   };
 }
@@ -244,7 +273,7 @@ test('a close for a trade we copied is emitted even after the trader was unfollo
 test('every open copy is polled on /dex/trade; a closed one becomes a close signal from the ledger', async () => {
   const ledger = [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1'), { ...copyEntry('tx-b', 'SOL', 0, 'bob', 't2'), status: 'closed' as const }];
   const { invo, make } = setup({ following: [], ledger });
-  invo.tradeItems.push({ baseShortId: 'short-t1', isOpen: false, closingPrice: 150, lastUpdate: 'x' });
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'close', details: { closePrice: 150, reasonClosed: 'user_closed' } }]));
 
   // Even on a fresh start (closes of our copies are never just indexed)
   const s = signals(await make().poll());
@@ -256,7 +285,7 @@ test('every open copy is polled on /dex/trade; a closed one becomes a close sign
 
 test('closes of trades we hold no copy of are skipped; each close is emitted once', async () => {
   const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
-  invo.tradeItems.push({ baseShortId: 'short-t1', isOpen: false, lastUpdate: 'x' });
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'close' }]));
   const w = make();
   // Fresh start: the /dex/trade close of our copy is emitted
   assert.deepEqual(signals(await w.poll()).map(x => x.source), ['trade_poll']);
@@ -384,14 +413,79 @@ test('if the ledger can\'t be read, each newly seen followed-trader close is pas
   assert.deepEqual(signals(await w.poll()), []);
 });
 
-test('/dex/trade updates are informational and do not end --wait-for-signal', async () => {
+test('/dex/trade tp/sl updates are informational: no close, and they do not end --wait-for-signal', async () => {
   const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
   const w = make();
   await w.poll();
-  invo.tradeItems.push({ baseShortId: 'short-t1', isOpen: true, lastUpdate: 'y' });
+  // As on the live WLD trade: a TP and an SL set together
+  invo.trades.push(dexTrade('alice', 't1', [
+    { updateType: 'tp', investmentId: 'v2', updatedAt: '2026-10-02T19:31:31.448Z', details: { priceTarget: 0.58 } },
+    { updateType: 'sl', investmentId: 'v2', updatedAt: '2026-10-02T19:31:31.448Z', details: { stopLoss: 0.516 } },
+  ]));
   const events = await w.poll();
-  assert.ok(events.some(e => e.data.type === 'trade_update'));
+  assert.deepEqual(events.filter(e => e.data.type === 'trade_update').map(e => [e.data.updateType, e.data.baseShortId]), [['tp', 'short-t1'], ['sl', 'short-t1']]);
   assert.ok(!events.some(e => e.signal));
+  // The same updates aren't reported again
+  assert.equal((await w.poll()).filter(e => e.data.type === 'trade_update').length, 0);
+});
+
+test('the live /dex/trade close response (captured 2026-10-02) becomes a close signal for our copy', async () => {
+  const owner = '8439473c-be0a-4738-a7f5-6b932d551f0f';
+  const copy: CopyEntry = {
+    ...copyEntry('tx-eth', 'ETH', 0.01, 'x', 'x'),
+    source: {
+      creatorInvoUserId: owner,
+      portfolioId: '1f70989c-4bc7-4ee2-86a6-5d5aa5642359',
+      sourcePaperTradeBaseId: '1f5a1bc5-9e11-4dff-8c6b-b41696f1c52d',
+      sourcePaperTradeBaseShortId: 'QeGEOGIhfF',
+    },
+  };
+  const { invo, make } = setup({ following: [], ledger: [copy] });
+  invo.rawTradeResponse = {
+    success: true,
+    data: [{
+      creatorAppUserId: owner,
+      portfolioId: '1f70989c-4bc7-4ee2-86a6-5d5aa5642359',
+      investmentBaseId: '1f5a1bc5-9e11-4dff-8c6b-b41696f1c52d',
+      investmentBaseShortId: 'QeGEOGIhfF',
+      unmimickedCount: 1,
+      unseenCount: 1,
+      updates: [{
+        investmentId: '254923ca-1dff-4b6d-818e-5ab3515db8ac',
+        investmentBaseId: '1f5a1bc5-9e11-4dff-8c6b-b41696f1c52d',
+        isSeen: false,
+        updatedAt: '2026-10-02T14:31:15.806Z',
+        updateType: 'close',
+        isMimicked: false,
+        details: { closePrice: 2730.7, reasonClosed: 'user_closed' },
+      }],
+    }],
+  };
+  const s = signals(await make().poll());
+  assert.deepEqual(invo.calls.getTradeUpdates[0].map(w => w.baseShortId), ['QeGEOGIhfF']);
+  assert.deepEqual(s.map(x => [x.source, x.action, x.trade.coin, x.trade.closingPrice, x.mimicMeta.sourcePaperTradeBaseId]),
+    [['trade_poll', 'close', 'ETH', 2730.7, '1f5a1bc5-9e11-4dff-8c6b-b41696f1c52d']]);
+});
+
+test('a /dex/trade close for another trader\'s trade with the same short id is not ours', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.trades.push({ ...dexTrade('mallory', 't1', [{ updateType: 'close' }]), investmentBaseId: undefined });
+  assert.deepEqual(signals(await make().poll()), []);
+});
+
+test('a liquidation update also counts as the trade being over', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidated' }]));
+  assert.deepEqual(signals(await make().poll()).map(x => x.action), ['close']);
+});
+
+test('an unrecognised /dex/trade response is reported, not read as "no updates" silently', async () => {
+  const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  for (const raw of [{ investments: [] }, { success: false, error: 'boom' }]) {
+    invo.rawTradeResponse = raw;
+    const events = await make().poll();
+    assert.ok(events.some(e => e.stream === 'err' && e.data.source === 'trade' && /unrecognised \/dex\/trade response/.test(String(e.data.message))), JSON.stringify(raw));
+  }
 });
 
 test('an open and a close of the same trade in one poll: the open is dropped, in either feed order', async () => {

@@ -121,10 +121,16 @@ export function diffFollowed(prev: FollowedTrader[], next: FollowedTrader[]) {
 // --- Feed post filtering ---
 
 /**
- * open:   a new trade (the post says so: changes.isAdded === true)
- * update: any other change to an open trade. Invo's post doesn't say whether
- *         the trader added, reduced or just edited it, so it is never copied
- *         automatically — a reduce copied as an add would grow our position.
+ * A post's update.changes holds the PREVIOUS values of the fields that changed
+ * (a close carries changes: { isOpen: true, ... } — it was open before). A brand-new
+ * trade carries exactly { isAdded: false }: it wasn't added before. Seen on live
+ * posts 2026-10-02: update.createdAt == update.updatedAt, posted seconds later,
+ * and nothing earlier for that trade on /dex/trade.
+ *
+ * open:   a new trade: open, and changes is exactly { isAdded: false }
+ * update: any other change to an open trade. How Invo posts an add or a partial
+ *         close hasn't been seen yet, so it is never copied automatically — a
+ *         reduce copied as an add would grow our position.
  * close:  the trade is closed (isOpen === false)
  */
 export type SignalAction = 'open' | 'update' | 'close';
@@ -149,8 +155,15 @@ export function signalAction(update: any): SignalAction {
   // A closed trade is a close even without a closing price: treating it as an
   // update would ask whether to add to a position the trader has left
   if (update.isOpen === false) return 'close';
-  if (update.isOpen === true && update.changes?.isAdded === true) return 'open';
+  if (update.isOpen === true && isNewTrade(update.changes)) return 'open';
   return 'update';
+}
+
+/** changes is exactly { isAdded: false } — see SignalAction. */
+function isNewTrade(changes: unknown): boolean {
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) return false;
+  const keys = Object.keys(changes);
+  return keys.length === 1 && (changes as Record<string, unknown>).isAdded === false;
 }
 
 /**

@@ -158,6 +158,27 @@ export function sameTrade(a: TradeIds, b: TradeIds): boolean {
   return !!a.baseShortId && a.baseShortId === b.baseShortId;
 }
 
+/**
+ * Does a /dex/trade entry belong to this copy? Same trader (when the entry names
+ * one) and same trade, by baseId or baseShortId.
+ */
+function isCopyOf(c: CopyEntry, t: Partial<TradeIds>): boolean {
+  const src = c.source!;
+  if (t.ownerId && t.ownerId !== src.creatorInvoUserId) return false;
+  if (t.baseId && src.sourcePaperTradeBaseId) return t.baseId === src.sourcePaperTradeBaseId;
+  return !!t.baseShortId && t.baseShortId === src.sourcePaperTradeBaseShortId;
+}
+
+/**
+ * A /dex/trade update that means the trade is over: updateType "close" (seen
+ * live), or one naming a liquidation (not seen yet — either way the position is
+ * gone, and close.ts only acts on a copy it matches).
+ */
+export function isCloseUpdate(u: any): boolean {
+  const type = typeof u?.updateType === 'string' ? u.updateType.toLowerCase() : '';
+  return type === 'close' || type.includes('liquidat');
+}
+
 const copyIds = (c: CopyEntry): TradeIds => ({
   ownerId: c.source!.creatorInvoUserId,
   baseId: c.source!.sourcePaperTradeBaseId || undefined,
@@ -274,28 +295,48 @@ export class SignalWatcher {
     }
     if (!watch.size) return;
 
-    let items: any[];
+    // Response (seen live 2026-10-02):
+    //   { success, data: [ { creatorAppUserId, portfolioId, investmentBaseId, investmentBaseShortId,
+    //       unmimickedCount, unseenCount,
+    //       updates: [ { investmentId, investmentBaseId, updateType, updatedAt, isSeen, isMimicked, details } ] } ] }
+    // updateType seen: "close" (details: closePrice, reasonClosed), "tp", "sl". There is no isOpen field.
+    let trades: any[];
     try {
-      const data = await this.o.invo.getTradeUpdates([...watch.values()]);
-      items = data?.investments ?? data?.items ?? [];
+      const res = await this.o.invo.getTradeUpdates([...watch.values()]);
+      if (res?.success === false || !Array.isArray(res?.data)) {
+        err({ type: 'error', source: 'trade', message: `unrecognised /dex/trade response: ${JSON.stringify(res)?.slice(0, 200)}` });
+        return;
+      }
+      trades = res.data;
     } catch (e: any) {
       err({ type: 'error', source: 'trade', message: e.message });
       return;
     }
 
-    for (const item of items) {
-      const updateKey = `${item.baseShortId ?? item.id}_${item.lastUpdate ?? ''}`;
-      if (this.seenTrade.has(updateKey)) continue;
-      this.seenTrade.add(updateKey);
-      // Informational only (not a signal): lastUpdate may change often, and a close is
-      // emitted as a signal below. On a fresh start, existing updates are just indexed.
-      if (!fresh) out({ type: 'trade_update', poll: this.pollCount, data: item });
+    for (const t of trades) {
+      const ids = {
+        ownerId: typeof t?.creatorAppUserId === 'string' ? t.creatorAppUserId : undefined,
+        baseId: t?.investmentBaseId || undefined,
+        baseShortId: t?.investmentBaseShortId || undefined,
+      };
+      const copy = copies.find(c => isCopyOf(c, ids));
+      for (const u of Array.isArray(t?.updates) ? t.updates : []) {
+        const updateKey = `${ids.baseShortId ?? ids.baseId}_${u?.investmentId ?? ''}_${u?.updateType ?? ''}_${u?.updatedAt ?? ''}`;
+        if (this.seenTrade.has(updateKey)) continue;
+        this.seenTrade.add(updateKey);
+        // Informational only (not a signal). On a fresh start, existing updates are just indexed.
+        if (!fresh) {
+          out({
+            type: 'trade_update', poll: this.pollCount,
+            baseShortId: ids.baseShortId ?? null, ownerId: ids.ownerId ?? null,
+            updateType: u?.updateType ?? null, updatedAt: u?.updatedAt ?? null, details: u?.details ?? null,
+          });
+        }
 
-      if (item.isOpen !== false) continue;
-      const copy = copies.find(c => c.source!.sourcePaperTradeBaseShortId === item.baseShortId);
-      if (!copy) continue;
-      // Sent by emitCloses (and re-sent while the copy stays open)
-      this.rememberClose({ ...copyIds(copy), coin: copy.coin, closingPrice: item.closingPrice ?? null, source: 'trade_poll', catchUp });
+        if (!isCloseUpdate(u) || !copy) continue;
+        // Sent by emitCloses (and re-sent while the copy stays open) — even on a fresh start
+        this.rememberClose({ ...copyIds(copy), coin: copy.coin, closingPrice: u.details?.closePrice ?? null, source: 'trade_poll', catchUp });
+      }
     }
   }
 

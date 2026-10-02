@@ -307,10 +307,13 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
 **How it works:**
 - Loads the following list at startup; **exits with an error if it can't** (never copies anyone unverified)
 - Re-fetches the following list every 60s (`--refresh=<sec>`, min 10), and on demand (rate-limited) when the feed shows an unknown trader or portfolio. Follows/unfollows made in the Invo app take effect on the next refresh or restart. A failed refresh keeps the last list.
-- Polls `POST /dex/trade` every 5 seconds for every open copy in the ledger (plus any watch entries). A watched trade that turns closed becomes a `close` signal (`"source": "trade_poll"`) carrying the copy's IDs from the ledger, so it is caught even after you unfollow the trader (their posts leave the `following` feed). Other `/dex/trade` changes are printed as `trade_update` for information only — they don't end `--wait-for-signal`.
+- Polls `POST /dex/trade` every 5 seconds for every open copy in the ledger (plus any watch entries). A watched trade with an update of `updateType: "close"` (or a liquidation) becomes a `close` signal (`"source": "trade_poll"`) carrying the copy's IDs from the ledger, so it is caught even after you unfollow the trader (their posts leave the `following` feed). Other `/dex/trade` updates (e.g. `"tp"`, `"sl"`) are printed as `trade_update` for information only — they don't end `--wait-for-signal`.
 - Polls `POST /v1_0/posts/get_feed` (filter: `following`) every 5 seconds, paging back to the last post it has seen (up to 5 pages of 20; a `notice` says if a burst was bigger)
 - A post is a signal only if: `verifiedTrade: true`, not a repost, owner is in the current following list, and the portfolio belongs to that trader. **Exception:** a close of a trade we hold a copy of always gets through (`"copied": true`, `followed` may be `null`).
-- `action` is `open` (a new trade: the post says `changes.isAdded: true`), `update` (any other change to an open trade — Invo doesn't say whether it was an add, a reduce or an edit) or `close` (`isOpen: false`).
+- `action` is `open`, `update` or `close`. A post's `update.changes` holds the **previous** values of what changed:
+  - `open`: a new trade — open, and `changes` is exactly `{"isAdded": false}` ("wasn't added before"; confirmed on live posts)
+  - `close`: `isOpen: false` (live closes carry `changes: {"isOpen": true, "reasonClosed": null}`)
+  - `update`: any other change to an open trade. How Invo posts an add or a partial close hasn't been seen live yet, so it is never auto-copied
 - **Opens/updates must be recent:** only emitted if the post's `createdAt` is at most `--max-signal-age` seconds old (default 300). Older ones — e.g. a newly followed trader's earlier posts appearing in the feed — and posts without a readable `createdAt` are `skipped`, never copied.
 - **Every close is remembered for 24h** (in the monitor state), and a close signal is sent for each remembered trade **we hold an open copy of**:
   - a close seen before our copy was recorded (the trader closed while `trade.ts` was running) is sent as soon as the copy appears in the ledger, and a later open/update of a closed trade is `skipped`;
@@ -325,7 +328,7 @@ Portfolio ID arrays (`'["id1"]'`) are no longer needed; if passed they are ignor
   - `{"type":"following_loaded","traders":[...]}` — followed traders + portfolio IDs (stdout)
   - `{"type":"following_changed","added":[...],"removed":[...]}` — list changed on Invo (stdout; does NOT end `--wait-for-signal`)
   - `{"type":"signal",...}` — a followed trader opened, changed (`update`) or closed a verified trade, or a copied trade closed (stdout)
-  - `{"type":"trade_update",...}` — status update on watched position (stdout, informational)
+  - `{"type":"trade_update","baseShortId":...,"ownerId":...,"updateType":"tp","updatedAt":...,"details":{...}}` — an update on a watched trade (stdout, informational)
   - `{"type":"close_stuck",...}` — a copy is still open after 10 close signals (stdout; needs the user)
   - `{"type":"skipped","reason":...}` — trade post rejected by the filter (stderr)
   - `{"type":"error",...}` — non-fatal error (stderr)
@@ -632,7 +635,7 @@ All requests use `POST` with `Authorization: Bearer <jwt>`, `Content-Type: appli
 | `POST /v1_0/users/get_following` | Users the account follows | `{userId, query: null, params: {page, size: 20}}` → `{page, size, success, error, following: [{id, username, isPending, ...}]}` |
 | `POST /v1_0/portfolios/v2/get_users_portfolios` | A user's portfolios | `{userId, params: {isDeleted: false, page, size: 20}}` → `{portfolios: [{id, ownerId, title, winRate, ...}]}` |
 | `POST /dex/account/ready` | Check trading status | `{}` |
-| `POST /dex/trade` | Poll trade updates | `{investments: [{baseShortId, mimicStartedAt}]}` — **use the TRADER's baseShortId** (`signal.mimicMeta.sourcePaperTradeBaseShortId`) |
+| `POST /dex/trade` | Poll trade updates | `{investments: [{baseShortId, mimicStartedAt}]}` — **use the TRADER's baseShortId** (`signal.mimicMeta.sourcePaperTradeBaseShortId`). Response: `{success, data: [{creatorAppUserId, portfolioId, investmentBaseId, investmentBaseShortId, unmimickedCount, unseenCount, updates: [{investmentId, updateType, updatedAt, isSeen, isMimicked, details}]}]}`. `updateType` seen: `close` (details `closePrice`, `reasonClosed`), `tp`, `sl`; no `isOpen` field. Polling it doesn't mark updates as seen |
 | `POST /dex/position/create` | Record open in Invo wallet | Full payload (see RecordOpenPayload) |
 | `POST /dex/position/close` | Record close in Invo wallet | Full payload (see RecordClosePayload) |
 | `GET /investment/status/:id` | Investment status | — |

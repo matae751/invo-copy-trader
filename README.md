@@ -222,7 +222,7 @@ GET  /v1_0/users/get_user               → Current user (id)
 POST /v1_0/users/get_following          → Users you follow {userId, query, params: {page, size}}
 POST /v1_0/portfolios/v2/get_users_portfolios → A user's portfolios {userId, params: {isDeleted, page, size}}
 POST /dex/account/ready                 → Account readiness check
-POST /dex/trade                         → Trade status polling
+POST /dex/trade                         → Trade status polling (data[].updates[].updateType: close, tp, sl)
 POST /dex/position/create               → Record open in Invo wallet
 POST /dex/position/close                → Record close in Invo wallet
 GET  /investment/status/:id             → Investment status

@@ -225,7 +225,7 @@ function tradePost(over: { post?: any; update?: any } = {}) {
       owner: { id: 'u1', username: 'alice' },
       portfolio: { id: 'p1', title: 'Main' },
       isOpen: true,
-      changes: { isAdded: true },
+      changes: { isAdded: false }, // a new trade, as on live posts
       closingPrice: null,
       ...over.update,
     },
@@ -276,20 +276,57 @@ test('ignores non-trade posts', () => {
   assert.deepEqual(classifyPost({ id: 'x', update: { ticker: null } }, followed), { kind: 'ignore' });
 });
 
-test('action rules: only an explicitly new trade is an open; any other change is an ambiguous update', () => {
+test('action rules: only a new trade (changes exactly { isAdded: false }) is an open; other changes are updates', () => {
   const action = (update: any) => {
     const v = classifyPost(tradePost({ update }), followed);
     return v.kind === 'accept' ? v.action : v.kind;
   };
-  assert.equal(action({ isOpen: true, changes: { isAdded: true } }), 'open');
-  // Could be an add, a reduce or an edit — never auto-copied
-  assert.equal(action({ isOpen: true, changes: { isAdded: false } }), 'update');
+  // changes holds previous values: a new trade "wasn't added before"
+  assert.equal(action({ isOpen: true, changes: { isAdded: false } }), 'open');
+  // Anything else on an open trade — shape of an add / partial close not seen live yet — never auto-copied
+  assert.equal(action({ isOpen: true, changes: { isAdded: true } }), 'update');
+  assert.equal(action({ isOpen: true, changes: { isAdded: false, entrySize: 2 } }), 'update');
+  assert.equal(action({ isOpen: true, changes: { entrySize: 2 } }), 'update');
   assert.equal(action({ isOpen: true, changes: undefined }), 'update');
   assert.equal(action({ isOpen: true, changes: {} }), 'update');
+  assert.equal(action({ isOpen: true, changes: [false] }), 'update');
   // Closed without a closing price is still a close, never a possible add
   assert.equal(action({ isOpen: false, closingPrice: null }), 'close');
-  assert.equal(action({ isOpen: undefined, changes: { isAdded: true } }), 'update');
+  assert.equal(action({ isOpen: undefined, changes: { isAdded: false } }), 'update');
   assert.equal(action({ isOpen: false, closingPrice: 150 }), 'close');
+});
+
+test('a live new-trade post (WLD, captured 2026-10-02) is an open', () => {
+  const owner = 'd7600f11-c38d-427f-b945-91c547e57d71';
+  const portfolio = 'f392d602-4882-40bc-8198-6d681943284d';
+  const live = new Map<string, FollowedTrader>([[owner, { userId: owner, username: 'nicush', portfolios: [{ id: portfolio }] }]]);
+  const post = {
+    id: '05acaefa-4555-433d-819b-af5e78d17942',
+    repostId: null,
+    createdAt: '2026-10-02T19:31:06.168Z',
+    postTypeId: 'investment',
+    owner: { id: owner, username: 'nicush' },
+    update: {
+      id: '92938146-664a-4615-90ec-439e6540abe7',
+      owner: { id: owner, username: 'nicush' },
+      portfolio: { id: portfolio, title: 'Kitchen' },
+      baseId: '2db0d005-3dad-4d34-8471-d572877d8fee',
+      baseShortId: 'PG3fbHjtd7',
+      name: 'WLD',
+      ticker: 'WLD',
+      verifiedTrade: true,
+      directionLong: true,
+      leverage: 10,
+      entryPrice: 0.54142,
+      isOpen: true,
+      closingPrice: null,
+      changes: { isAdded: false },
+      createdAt: '2026-10-02T19:30:52.339Z',
+      updatedAt: '2026-10-02T19:30:52.339Z',
+    },
+  };
+  const v = classifyPost(post, live);
+  assert.equal(v.kind === 'accept' && v.action, 'open');
 });
 
 test('a close of a trade we copied gets through from someone no longer followed, a repost or an unknown portfolio', () => {
