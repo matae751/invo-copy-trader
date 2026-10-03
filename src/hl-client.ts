@@ -1,5 +1,5 @@
 import { Hyperliquid } from 'hyperliquid';
-import { limitPrice } from './sizing.js';
+import { limitPrice, TPSL_SLIPPAGE_PCT } from './sizing.js';
 import { timeoutSignal, withTimeout } from './timeout.js';
 
 const INVO_BUILDER = { address: '0x557edb253b1d7ed5f15b248a5a3fd919fa5d3c81', fee: 35 };
@@ -137,6 +137,71 @@ export async function getOrderFill(wallet: string, cloid: string): Promise<{ kno
     throw new Error(`orderStatus ${cloid}: unrecognised response ${JSON.stringify(data)?.slice(0, 200)}`);
   }
   return { known: true, filledQty: Math.max(0, origSz - left) };
+}
+
+/** An open order as frontendOpenOrders reports it (fields we use). */
+export interface HlOpenOrder {
+  coin: string;
+  side: string;
+  oid: number;
+  cloid?: string | null;
+  isTrigger?: boolean;
+  isPositionTpsl?: boolean;
+  reduceOnly?: boolean;
+  orderType?: string;
+  triggerPx?: string;
+}
+
+/** Every open order on the account (incl. TP/SL triggers). Throws on anything unreadable. */
+export async function getOpenOrders(wallet: string): Promise<HlOpenOrder[]> {
+  const resp = await fetch('https://api.hyperliquid.xyz/info', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    ...timeoutSignal(),
+    body: JSON.stringify({ type: 'frontendOpenOrders', user: wallet }),
+  });
+  if (!resp.ok) throw new Error(`frontendOpenOrders: HTTP ${resp.status}`);
+  const data: any = await resp.json();
+  if (!Array.isArray(data)) throw new Error(`frontendOpenOrders: unrecognised response ${JSON.stringify(data)?.slice(0, 200)}`);
+  return data;
+}
+
+/**
+ * A position take-profit / stop-loss, placed the way the Invo app places them
+ * (seen in this wallet's order history): a reduce-only trigger market order with
+ * grouping positionTpsl and size 0, so it covers the whole coin position as it
+ * grows or shrinks and Hyperliquid cancels it when the position closes. The
+ * limit is the trigger ± 5%, like the app's.
+ */
+export async function placePositionTpsl(
+  coin: string,
+  isLong: boolean, // the position's side; the trigger order is the opposite side
+  which: 'tp' | 'sl',
+  triggerPx: number, // exact — callers check it is a valid HL price (assertExactPerpPrice)
+  szDecimals: number,
+  cloid: string,
+) {
+  const isBuy = !isLong;
+  const limitPx = limitPrice(triggerPx, isBuy, szDecimals, TPSL_SLIPPAGE_PCT);
+  const s = getSdk();
+  return withTimeout(s.exchange.placeOrder({
+    orders: [{
+      coin: toSdkCoin(coin),
+      is_buy: isBuy,
+      sz: 0,
+      limit_px: limitPx,
+      order_type: { trigger: { triggerPx, isMarket: true, tpsl: which } },
+      reduce_only: true,
+      cloid,
+    }],
+    grouping: 'positionTpsl',
+    builder: INVO_BUILDER,
+  }), `place ${which} ${coin}`);
+}
+
+export async function cancelByCloid(coin: string, cloid: string) {
+  const s = getSdk();
+  return withTimeout(s.exchange.cancelOrderByCloid(toSdkCoin(coin), cloid), `cancel ${cloid} ${coin}`);
 }
 
 export { INVO_BUILDER };

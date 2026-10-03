@@ -254,3 +254,62 @@ export function sizeIncrease(
   }
   return { ...result(qty, mid, szDecimals, px), capUsd: round2(capUsd) };
 }
+
+// --- Replicating the trader's entry and TP/SL prices ---
+
+/**
+ * The price a copy's open is sized and limited from. The trader filled at
+ * `entryPrice`; we never pay more than SLIPPAGE_PCT worse than that. If the
+ * market already moved further against us than that, the trader's entry can't
+ * be replicated and this throws (a refused copy, not a chased one). If the
+ * market is better than their entry, we use it as is.
+ *   buy:  min(mid, entry) — limit ≤ entry × (1 + s)
+ *   sell: max(mid, entry) — limit ≥ entry × (1 − s)
+ */
+export function entryBoundPx(mid: number, entryPrice: number, isBuy: boolean, slippagePct = SLIPPAGE_PCT): number {
+  if (!(mid > 0) || !Number.isFinite(mid)) throw new Error(`Invalid mid price: ${mid}`);
+  if (!(entryPrice > 0) || !Number.isFinite(entryPrice)) throw new Error(`Invalid trader entry price: ${entryPrice}`);
+  const adverse = isBuy ? mid / entryPrice - 1 : 1 - mid / entryPrice;
+  if (adverse > slippagePct + EPS) {
+    throw new Error(
+      `Price moved ${(adverse * 100).toFixed(2)}% against the trader's entry ($${entryPrice} → mid $${mid}), more than the ` +
+      `${slippagePct * 100}% allowed — refusing rather than entering at a different price than the trader`,
+    );
+  }
+  return isBuy ? Math.min(mid, entryPrice) : Math.max(mid, entryPrice);
+}
+
+/** Limit-price slippage on TP/SL trigger orders: what the Invo app uses (seen on its position TP/SL orders). */
+export const TPSL_SLIPPAGE_PCT = 0.05;
+
+/**
+ * Throws unless `px` is a price Hyperliquid accepts as is for this asset (at most
+ * 5 significant figures — integers always pass — and at most 6 − szDecimals
+ * decimals). A trader's TP/SL is never rounded: a different trigger price is a
+ * different TP/SL.
+ */
+export function assertExactPerpPrice(px: number, szDecimals: number, label: string): void {
+  if (!(px > 0) || !Number.isFinite(px)) throw new Error(`${label} ${px} is not a valid price`);
+  const decimals = Math.max(0, MAX_PERP_PRICE_DECIMALS - szDecimals);
+  const onDecimals = Number(px.toFixed(decimals)) === px;
+  const onSigFigs = Number.isInteger(px) || parseFloat(px.toPrecision(5)) === px;
+  if (!onDecimals || !onSigFigs) {
+    throw new Error(`${label} ${px} can't be placed on Hyperliquid exactly (max 5 significant figures and ${decimals} decimals) — not rounding the trader's price`);
+  }
+}
+
+/**
+ * A TP/SL trigger must be on the right side of the current price, or Hyperliquid
+ * would fire it at once (the trader's, still open, evidently hasn't).
+ *   long:  tp > mid, sl < mid      short: tp < mid, sl > mid
+ */
+export function assertTriggerSide(which: 'tp' | 'sl', triggerPx: number, mid: number, isLong: boolean): void {
+  const above = triggerPx > mid;
+  const ok = (which === 'tp') === isLong ? above : triggerPx < mid;
+  if (!ok) {
+    throw new Error(
+      `The trader's ${which === 'tp' ? 'take-profit' : 'stop-loss'} $${triggerPx} is already ${above ? 'above' : 'at or below'} the ` +
+      `current price $${mid} for a ${isLong ? 'long' : 'short'} — it would trigger immediately; not replicated`,
+    );
+  }
+}

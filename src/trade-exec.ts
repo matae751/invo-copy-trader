@@ -4,21 +4,36 @@
 
 import { randomBytes, randomUUID } from 'crypto';
 import type { RecordOpenPayload } from './invo-client.js';
-import { classifyTrader, copyRange, sizeInitial, sizeIncrease, tierTargetUsd, SLIPPAGE_PCT } from './sizing.js';
+import {
+  assertExactPerpPrice,
+  assertTriggerSide,
+  classifyTrader,
+  copyRange,
+  entryBoundPx,
+  sizeInitial,
+  sizeIncrease,
+  tierTargetUsd,
+  SLIPPAGE_PCT,
+} from './sizing.js';
 import { getTraderStats, type TraderStatsClient } from './trader-stats.js';
-import { parseMimicMetaArg, MANUAL_TRADE_ARG } from './mimic-meta.js';
+import { MANUAL_TRADE_ARG, type MimicMeta } from './mimic-meta.js';
 import { parseLeverageArg, checkLeverage } from './leverage.js';
 import {
   beginOpen,
   findCopiedUpdate,
+  findCopyToClose,
+  isSameTrade,
   reconcileWithPosition,
   roundQty,
   settleOrder,
   type CopyEntry,
   type LedgerStore,
+  type Side,
 } from './copy-ledger.js';
 import { assertHlOk, orderFilledQty, orderRejection } from './hl-response.js';
 import { settlePendingOrders, type OrderLookup } from './pending-orders.js';
+import { isSignalArg, parseTradeSignal, MAX_CHANGE_AGE_MS, type IncreaseSignal, type OpenSignal } from './trade-signal.js';
+import { coinTriggers, replaceTpsl, type TpslHl, type TpslOutcome } from './tpsl-exec.js';
 
 export interface HlMeta {
   universe: { name: string; szDecimals: number; maxLeverage: number }[];
@@ -47,7 +62,7 @@ export interface ExecHl extends OrderLookup {
   ): Promise<any>;
 }
 
-export interface TradeHl extends ExecHl {
+export interface TradeHl extends ExecHl, TpslHl {
   setLeverage(coin: string, leverage: number): Promise<unknown>;
   /** The account's current Hyperliquid equity in USD (marginSummary.accountValue). */
   getAccountEquity(): Promise<number>;
@@ -69,7 +84,7 @@ export interface TradeDeps {
 export class UsageError extends Error {}
 
 export const TRADE_USAGE =
-  `Usage: trade <coin> <long|short> <size (ignored — computed from trader performance)> <leverage> <mimicMetaJson | ${MANUAL_TRADE_ARG}>`;
+  `Usage: trade '<open or increase signal JSON>'  |  trade <coin> <long|short> <size (ignored)> <leverage> ${MANUAL_TRADE_ARG}`;
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -114,7 +129,7 @@ export function checkExistingLeverage(coin: string, position: HlPosition, levera
   if (value !== leverage) {
     throw new Error(
       `Refusing ${leverage}x on ${coin}: the existing ${coin} position is ${value}x isolated, and leverage applies to the ` +
-      `whole position (other copies included). Re-run with ${value} to add at the existing leverage, if the user agrees`,
+      `whole position (other copies included) — the trader's ${leverage}x can't be replicated while it is held`,
     );
   }
 }
@@ -123,22 +138,58 @@ function refuseRepeat(entry: CopyEntry, updateId: string): never {
   throw new Error(`Already copied trader update ${updateId} (ledger entry ${entry.id}, ${entry.status}) — refusing to trade it again`);
 }
 
+
+/**
+ * trade.ts:
+ *   trade '<signal JSON>'                      a copy: `open` or `increase` signal from the monitor.
+ *                                              Coin, side, leverage, entry and TP/SL all come from it.
+ *   trade <coin> <side> <ignored> <lev> manual  a trade the user asked for that copies nobody
+ */
 export async function runTrade(args: string[], deps: TradeDeps) {
+  if (args.length === 1 && isSignalArg(args[0])) {
+    const sig = parseTradeSignal(args[0]);
+    if (sig.kind === 'open') return execute({ mode: 'open', coin: sig.coin, side: sig.side, leverage: sig.leverage, copy: sig, ignoredSizeArg: null }, deps);
+    if (sig.kind === 'increase') return execute({ mode: 'increase', sig }, deps);
+    throw new Error(`trade.ts runs open and increase signals; a ${sig.kind} signal goes to ${sig.kind === 'tpsl' ? 'tpsl.ts' : 'close.ts'}`);
+  }
+
+  const [coin, side, ignoredSizeArg, leverageStr, mimicArg] = args;
+  if (!coin || (side !== 'long' && side !== 'short')) throw new UsageError(TRADE_USAGE);
+  if (mimicArg !== MANUAL_TRADE_ARG) {
+    throw new Error(
+      mimicArg?.trim()
+        ? `A copy is run from the trader's signal: trade.ts '<signal JSON>' — its coin, side, leverage, entry and TP/SL are taken from it, ` +
+          `never typed separately. Positional arguments are only for a '${MANUAL_TRADE_ARG}' trade`
+        : `mimicMeta is required: pass the whole signal (trade.ts '<signal JSON>'), or '${MANUAL_TRADE_ARG}' for a trade that copies nobody`,
+    );
+  }
+  const leverage = parseLeverageArg(leverageStr);
+  return execute({ mode: 'open', coin, side, leverage, copy: null, ignoredSizeArg: ignoredSizeArg ?? null }, deps);
+}
+
+type Request =
+  | { mode: 'open'; coin: string; side: Side; leverage: number; copy: OpenSignal | null; ignoredSizeArg: string | null }
+  | { mode: 'increase'; sig: IncreaseSignal };
+
+async function execute(req: Request, deps: TradeDeps) {
   const { hl, invo } = deps;
   const newId = deps.newId ?? randomUUID;
   const newCloid = deps.newCloid ?? randomCloid;
   const now = deps.now ?? (() => new Date());
 
-  // <size> is kept for argument-position compatibility but ignored: size is computed here
-  const [coin, side, ignoredSizeArg, leverageStr, mimicMetaJson] = args;
-  if (!coin || (side !== 'long' && side !== 'short')) throw new UsageError(TRADE_USAGE);
+  const coin = req.mode === 'open' ? req.coin : req.sig.coin;
+  const copy = req.mode === 'open' ? req.copy : null;
+  const mimicMetaArg: MimicMeta | null = copy?.mimicMeta ?? null;
+  // The trader update this order copies: the open's update id, or the /dex/trade change
+  const updateId = req.mode === 'open' ? mimicMetaArg?.initialSourcePaperUpdateId ?? null : req.sig.updateId;
 
-  const isBuy = side === 'long';
-  const leverage = parseLeverageArg(leverageStr);
-  // Validated before touching HL: a copy must carry the trader's trade IDs (incl. their baseShortId).
-  // null = explicit manual trade (no mimicMeta sent)
-  const mimicMetaArg = parseMimicMetaArg(mimicMetaJson);
-  const updateId = mimicMetaArg?.initialSourcePaperUpdateId ?? null;
+  // --- Checked before Hyperliquid is touched ---
+  if (req.mode === 'increase') {
+    const ageMs = now().getTime() - Date.parse(req.sig.updatedAt);
+    if (ageMs > MAX_CHANGE_AGE_MS) {
+      throw new Error(`The trader's increase was ${Math.round(ageMs / 1000)}s ago — too old to copy at today's price (max ${MAX_CHANGE_AGE_MS / 1000}s)`);
+    }
+  }
   // Read the ledger before trading: a copy we can't record could never be closed by its trader's signal
   let ledgerEntries = deps.ledger.load();
   // Each trader update is copied once: a repeated signal (re-run, retry, duplicate post) must not add again.
@@ -153,7 +204,10 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   const assetIndex = meta.universe.findIndex(a => a.name === coin);
   if (assetIndex < 0) throw new Error(`Unknown coin: ${coin}`);
   const { szDecimals, maxLeverage } = meta.universe[assetIndex];
-  checkLeverage(leverage, coin, maxLeverage);
+  if (req.mode === 'open') checkLeverage(req.leverage, coin, maxLeverage);
+  // The trader's TP/SL must be placeable exactly as they set it, or the copy isn't opened
+  if (copy?.tp != null) assertExactPerpPrice(copy.tp, szDecimals, "The trader's take-profit");
+  if (copy?.sl != null) assertExactPerpPrice(copy.sl, szDecimals, "The trader's stop-loss");
 
   // An earlier run's order in this coin that was never recorded is settled first (throws if it can't be)
   const pending = await settlePendingOrders(hl, deps.ledger, ledgerEntries, coin, szDecimals, now().toISOString());
@@ -175,19 +229,70 @@ export async function runTrade(args: string[], deps: TradeDeps) {
     ledgerEntries = reconcile.entries;
   }
 
-  if (existingSzi !== 0 && (existingSzi > 0) !== isBuy) {
-    throw new Error(`Refusing ${side} ${coin}: existing position is ${existingSzi > 0 ? 'long' : 'short'} ${Math.abs(existingSzi)}`);
+  let side: Side;
+  let leverage: number;
+  let target: CopyEntry | null = null; // increase: the copy being added to
+  if (req.mode === 'increase') {
+    const match = findCopyToClose(ledgerEntries, coin, req.sig.identity);
+    if (match.kind === 'refuse') throw new Error(`Can't copy the increase: ${match.reason}`);
+    target = match.entry;
+    side = target.side;
+    if (req.sig.side && req.sig.side !== side) throw new Error(`increase signal is ${req.sig.side} but the copy is ${side}`);
+    if (existingSzi === 0 || (existingSzi > 0) !== (side === 'long')) {
+      throw new Error(`Can't copy the increase: the ${coin} position (${existingSzi}) doesn't hold the ${side} copy`);
+    }
+    // Same leverage as the copy: the trader's increase doesn't change it, and neither do we
+    const copyLev = target.leverage ?? existing!.leverage?.value;
+    checkExistingLeverage(coin, existing!, copyLev as number);
+    leverage = copyLev as number;
+  } else {
+    side = req.side;
+    leverage = req.leverage;
+    if (copy) {
+      const held = ledgerEntries.find(e =>
+        (e.status === 'open' || e.status === 'pending') && e.coin === coin &&
+        isSameTrade(e.source, { creatorInvoUserId: copy.mimicMeta.creatorInvoUserId, sourcePaperTradeBaseId: copy.mimicMeta.sourcePaperTradeBaseId }));
+      if (held) throw new Error(`Already holding a copy of this trade (ledger entry ${held.id}) — an add arrives as an increase signal`);
+    }
+    if (existingSzi !== 0 && (existingSzi > 0) !== (side === 'long')) {
+      throw new Error(`Refusing ${side} ${coin}: existing position is ${existingSzi > 0 ? 'long' : 'short'} ${Math.abs(existingSzi)}`);
+    }
+    if (existingSzi !== 0) checkExistingLeverage(coin, existing!, leverage);
   }
-  if (existingSzi !== 0) checkExistingLeverage(coin, existing!, leverage);
+  const isBuy = side === 'long';
+
+  // Position TP/SL on Hyperliquid act on the whole coin position: a new position can't
+  // join one that has them, and a trader's TP/SL can't be set on a position others share
+  if (req.mode === 'open') {
+    const triggers = coinTriggers(await hl.getOpenOrders(), coin);
+    if (triggers.length) {
+      throw new Error(`${coin} has TP/SL orders on the position (${triggers.map(o => o.cloid ?? o.orderType).join(', ')}) — they would ` +
+        `act on this new position too, so it can't be opened with the trader's parameters`);
+    }
+    if (copy && (copy.tp !== null || copy.sl !== null) && existingSzi !== 0) {
+      throw new Error(`The trader set a TP/SL, but the ${coin} position already holds other trades — a Hyperliquid TP/SL would ` +
+        `close those too, so this trade can't be replicated`);
+    }
+  }
+
+  // A copy whose entry or TP/SL can't be replicated at today's price is refused before
+  // leverage is set (checked again with the price the order is sent at, below)
+  if (copy) {
+    const mid0 = parseFloat((await hl.getAllMids())[coin]);
+    if (!mid0) throw new Error(`No mid price for ${coin}`);
+    entryBoundPx(mid0, copy.entryPrice, isBuy, SLIPPAGE_PCT);
+    if (copy.tp != null) assertTriggerSide('tp', copy.tp, mid0, isBuy);
+    if (copy.sl != null) assertTriggerSide('sl', copy.sl, mid0, isBuy);
+  }
 
   // Trader's tier, as a % of equity. Stats null on any lookup failure → poor tier (5%)
-  const statsLookup = await getTraderStats(invo, mimicMetaArg);
+  const statsLookup = await getTraderStats(invo, mimicMetaArg ?? target?.source ?? null);
   const perf = classifyTrader(statsLookup.stats);
 
-  // Set leverage. HL reports a rejection (e.g. can't switch an open cross position to
-  // isolated) in the response body; never place the order at a leverage we didn't set.
+  // Set leverage for a new position. HL reports a rejection (e.g. can't switch an open cross
+  // position to isolated) in the response body; never place the order at a leverage we didn't set.
   // (With a position open, checkExistingLeverage above means this changes nothing.)
-  assertHlOk(await hl.setLeverage(coin, leverage), `Setting ${coin} to ${leverage}x isolated`);
+  if (req.mode === 'open') assertHlOk(await hl.setLeverage(coin, leverage), `Setting ${coin} to ${leverage}x isolated`);
 
   // Equity and price last: the stats lookup and leverage change above are network calls
   // (up to 20s each), and the size must track the balance and price as they are when the
@@ -196,15 +301,24 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   const mid = parseFloat((await hl.getAllMids())[coin]);
   if (!mid) throw new Error(`No mid price for ${coin}`);
 
-  // Size: initial copy → the tier's % of equity, clamped to 5–15% of equity;
-  // increase → the tier's % of equity (≤ 15%), capped at 80% of current notional.
-  // Bounds hold at the worst-case fill (mid ± SLIPPAGE_PCT), not just at mid.
-  const isIncrease = existingSzi !== 0;
-  const currentNotionalUsd = Math.abs(existingSzi) * mid;
-  const targetUsd = Math.min(tierTargetUsd(range.equityUsd, perf.equityPct), range.maxUsd);
-  const sizing = isIncrease
-    ? sizeIncrease(targetUsd, currentNotionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT)
-    : sizeInitial(targetUsd, range, mid, szDecimals, isBuy, SLIPPAGE_PCT);
+  // A copy enters no worse than the trader's own entry allows (see entryBoundPx), and its
+  // TP/SL must still be on the right side of the price, or nothing is opened
+  const orderPx = copy ? entryBoundPx(mid, copy.entryPrice, isBuy, SLIPPAGE_PCT) : mid;
+  if (copy?.tp != null) assertTriggerSide('tp', copy.tp, mid, isBuy);
+  if (copy?.sl != null) assertTriggerSide('sl', copy.sl, mid, isBuy);
+
+  // Size — the only thing not copied from the trader: always from our own equity.
+  //   open:     the tier's % of equity, clamped to 5–15% of equity
+  //   increase: the trader's add in proportion to our copy (their change / their size before),
+  //             capped at the tier's % of equity (≤ 15%) and at 80% of the copy's notional
+  // Bounds hold at the worst-case fill (orderPx ± SLIPPAGE_PCT), not just at mid.
+  const tierUsd = Math.min(tierTargetUsd(range.equityUsd, perf.equityPct), range.maxUsd);
+  const copyNotionalUsd = target ? target.qty * mid : 0;
+  const mirroredUsd = req.mode === 'increase' ? copyNotionalUsd * req.sig.ratio : null;
+  const targetUsd = mirroredUsd === null ? tierUsd : Math.min(mirroredUsd, tierUsd);
+  const sizing = req.mode === 'increase'
+    ? sizeIncrease(targetUsd, copyNotionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT)
+    : sizeInitial(targetUsd, range, orderPx, szDecimals, isBuy, SLIPPAGE_PCT);
   const sizeStr = sizing.qty;
 
   const clientTxId = newId();
@@ -212,30 +326,33 @@ export async function runTrade(args: string[], deps: TradeDeps) {
 
   // Write the order to the ledger before sending it: if this process dies after
   // the order fills, the next run settles it by cloid instead of losing the fill.
+  const source = target?.source ?? (mimicMetaArg && {
+    creatorInvoUserId: mimicMetaArg.creatorInvoUserId,
+    portfolioId: mimicMetaArg.portfolioId,
+    sourcePaperTradeBaseId: mimicMetaArg.sourcePaperTradeBaseId,
+    sourcePaperTradeBaseShortId: mimicMetaArg.sourcePaperTradeBaseShortId,
+  });
   const begun = beginOpen(ledgerEntries, {
     id: clientTxId,
     coin,
     side,
-    source: mimicMetaArg && {
-      creatorInvoUserId: mimicMetaArg.creatorInvoUserId,
-      portfolioId: mimicMetaArg.portfolioId,
-      sourcePaperTradeBaseId: mimicMetaArg.sourcePaperTradeBaseId,
-      sourcePaperTradeBaseShortId: mimicMetaArg.sourcePaperTradeBaseShortId,
-    },
+    source,
     sourceUpdateId: updateId,
     cloid,
     requestedQty: parseFloat(sizeStr),
     now: now().toISOString(),
+    leverage,
+    traderOpenedAt: copy?.traderOpenedAt ?? null,
   });
   deps.ledger.save(begun.entries);
 
-  // Place order on HL
+  // Place order on HL (limit derived from orderPx — see sizing.limitPrice)
   const nonceMs = now().getTime();
   let orderResult: any = null;
   let orderError: string | null = null;
   let requestFailed = false;
   try {
-    orderResult = await hl.placeMarketOrder(coin, isBuy, sizeStr, SLIPPAGE_PCT, mid, szDecimals, false, cloid);
+    orderResult = await hl.placeMarketOrder(coin, isBuy, sizeStr, SLIPPAGE_PCT, orderPx, szDecimals, false, cloid);
     orderError = orderRejection(orderResult);
   } catch (e: any) {
     // May or may not have reached HL — resolveFill looks it up by cloid
@@ -245,12 +362,15 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   const filled = await resolveFill(hl, orderResult, cloid, requestFailed);
 
   const base = {
+    action: req.mode,
     coin,
     side,
     size: sizeStr,
     leverage,
+    ...(copy && { trader: { entryPrice: copy.entryPrice, tp: copy.tp, sl: copy.sl } }),
+    ...(req.mode === 'increase' && { trader: { ratio: req.sig.ratio, updateId: req.sig.updateId } }),
     sizing: {
-      mode: isIncrease ? 'increase' : 'initial',
+      mode: req.mode === 'increase' ? 'increase' : 'initial',
       tier: perf.tier,
       equityUsd: round2(range.equityUsd),
       tierPct: perf.equityPct,
@@ -258,19 +378,21 @@ export async function runTrade(args: string[], deps: TradeDeps) {
       minUsd: round2(range.minUsd),
       maxUsd: round2(range.maxUsd),
       targetUsd: round2(targetUsd),
+      ...(mirroredUsd !== null && { mirroredUsd: round2(mirroredUsd) }),
       notionalUsd: sizing.notionalUsd,
       minFillNotionalUsd: sizing.minFillNotionalUsd,
       maxFillNotionalUsd: sizing.maxFillNotionalUsd,
       mid,
+      ...(orderPx !== mid && { orderPx }),
       limitPx: sizing.limitPx,
-      ...('capUsd' in sizing && { currentNotionalUsd: Math.round(currentNotionalUsd * 100) / 100, capUsd: sizing.capUsd }),
+      ...('capUsd' in sizing && { currentNotionalUsd: round2(copyNotionalUsd), capUsd: sizing.capUsd }),
       reasons: perf.reasons,
       statsLookup: statsLookup.status,
-      ignoredSizeArg: ignoredSizeArg ?? null,
+      ...(req.mode === 'open' && !copy && { ignoredSizeArg: req.ignoredSizeArg }),
     },
-    manual: mimicMetaArg === null,
+    manual: source === null,
     // Trader's baseShortId (for /dex/trade watch entries) — null for a manual trade
-    sourceBaseShortId: mimicMetaArg?.sourcePaperTradeBaseShortId ?? null,
+    sourceBaseShortId: source?.sourcePaperTradeBaseShortId ?? null,
     clientTxId,
     cloid,
     qtyBefore,
@@ -279,6 +401,7 @@ export async function runTrade(args: string[], deps: TradeDeps) {
     ...(pending.settled.length && { settledPendingOrders: pending.settled }),
     ...(reconcile.reconciled.length && { reconciledEntryIds: reconcile.reconciled }),
   };
+  const wantsTpsl = !!copy && (copy.tp !== null || copy.sl !== null);
 
   if (filled === null) {
     // Neither the response nor HL says what happened. The ledger keeps the order
@@ -291,6 +414,7 @@ export async function runTrade(args: string[], deps: TradeDeps) {
       ledger: { entryId: begun.entryId, copyQty: null, error: `order ${cloid} unsettled — the next ${coin} trade/close settles it` },
       qtyAfter: null,
       invoResult: null,
+      ...(wantsTpsl && { tpsl: { error: `not placed: fill unknown — once settled, run tpsl.ts with this open signal` } }),
     };
   }
 
@@ -307,6 +431,9 @@ export async function runTrade(args: string[], deps: TradeDeps) {
 
   // Record on Invo (non-fatal if it fails — position is open on HL regardless).
   // Nothing filled → nothing to record.
+  const invoMimicMeta: MimicMeta | null = req.mode === 'increase'
+    ? (source && { ...source, initialSourcePaperUpdateId: req.sig.investmentId })
+    : mimicMetaArg;
   let invoResult: any = null;
   if (filledQty > 0) {
     try {
@@ -318,8 +445,8 @@ export async function runTrade(args: string[], deps: TradeDeps) {
           side: isBuy ? 'long' : 'short',
           marginMode: 'isolated',
           leverage,
-          tpPx: null,
-          slPx: null,
+          tpPx: copy?.tp != null ? String(copy.tp) : null,
+          slPx: copy?.sl != null ? String(copy.sl) : null,
         },
         submission: {
           hlOrder: orderResult,
@@ -331,7 +458,7 @@ export async function runTrade(args: string[], deps: TradeDeps) {
           qtyAfter,
           intendedLeverage: leverage,
         },
-        ...(mimicMetaArg && { mimicMeta: mimicMetaArg }),
+        ...(invoMimicMeta && { mimicMeta: invoMimicMeta }),
       });
     } catch (e: any) {
       invoResult = { error: e.message };
@@ -342,15 +469,43 @@ export async function runTrade(args: string[], deps: TradeDeps) {
   // Settle the pending order: record what filled against the trader we copied,
   // so only their close signal closes it
   let ledger: { entryId: string | null; copyQty: number | null; error?: string };
+  let settled: CopyEntry[] | null = null;
   try {
-    const entries = settleOrder(begun.entries, begun.entryId, filledQty, szDecimals, now().toISOString(), positionRecordId);
-    deps.ledger.save(entries);
-    const entry = entries.find(e => e.id === begun.entryId);
+    settled = settleOrder(begun.entries, begun.entryId, filledQty, szDecimals, now().toISOString(), positionRecordId);
+    deps.ledger.save(settled);
+    const entry = settled.find(e => e.id === begun.entryId);
     ledger = filledQty > 0
       ? { entryId: begun.entryId, copyQty: entry!.qty }
       : { entryId: null, copyQty: null, error: 'no fill — nothing recorded' };
   } catch (e: any) {
+    settled = null;
     ledger = { entryId: begun.entryId, copyQty: null, error: `ledger write failed: ${e.message} — the order stays pending; the next ${coin} trade/close settles it` };
+  }
+
+  // The trader's TP/SL, as position TP/SL on the copy we just opened
+  let tpsl: { outcomes?: TpslOutcome[]; error?: string } | undefined;
+  if (wantsTpsl && filledQty > 0) {
+    if (!settled) {
+      tpsl = { error: 'not placed: the ledger could not be written — once settled, run tpsl.ts with this open signal' };
+    } else {
+      const outcomes: TpslOutcome[] = [];
+      let entries = settled;
+      for (const [which, px] of [['tp', copy!.tp], ['sl', copy!.sl]] as const) {
+        if (px === null) continue;
+        const entry = entries.find(e => e.id === begun.entryId)!;
+        try {
+          const r = await replaceTpsl(hl, deps.ledger, entries, entry, which, px, copy!.traderOpenedAt ?? '', szDecimals, newCloid(),
+            now().toISOString(), []);
+          entries = r.entries;
+          outcomes.push(r.outcome);
+        } catch (e: any) {
+          outcomes.push({ which, status: 'error', triggerPx: px, error: e.message });
+        }
+      }
+      tpsl = outcomes.some(o => o.status === 'error')
+        ? { outcomes, error: 'the trader\'s TP/SL is not fully replicated — retry with tpsl.ts and this open signal' }
+        : { outcomes };
+    }
   }
 
   return {
@@ -362,5 +517,6 @@ export async function runTrade(args: string[], deps: TradeDeps) {
     ledger,
     qtyAfter,
     invoResult,
+    ...(tpsl && { tpsl }),
   };
 }

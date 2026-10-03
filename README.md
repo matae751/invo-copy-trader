@@ -44,8 +44,9 @@ A fully autonomous copy trading system that connects [Invo](https://app.invoapp.
 │   ├── discover.ts   ── scan & rank 100+ traders                 │
 │   ├── follow.ts     ── social graph management                  │
 │   ├── monitor.ts    ── event-driven signal detection            │
-│   ├── trade.ts      ── open position (HL + Invo)                │
-│   └── close.ts      ── close one trader's copy (copy ledger)    │
+│   ├── trade.ts      ── open / add to a copy (HL + Invo)         │
+│   ├── close.ts      ── close / reduce one trader's copy         │
+│   └── tpsl.ts       ── mirror the trader's TP/SL                │
 │         │                                                       │
 │    ┌────┴────────────────────┐                                  │
 │    ▼                         ▼                                  │
@@ -97,9 +98,10 @@ All commands run via `npx tsx src/commands/<cmd>.ts`.
 | `monitor.ts` | Real-time signal monitor (your Invo following list) | `npx tsx src/commands/monitor.ts` |
 | `monitor.ts` | Extra /dex/trade watch entries (open copies are polled automatically) | `npx tsx src/commands/monitor.ts '[{"baseShortId":"x","mimicStartedAt":"..."}]'` |
 | `monitor.ts` | Wait-for-signal mode (resumes from `data/monitor-state.json`; missed opens copied only if stopped ≤ `--max-catchup`, default 300s) | `npx tsx src/commands/monitor.ts --wait-for-signal` |
-| `trade.ts` | Open a position (copy) | `npx tsx src/commands/trade.ts SOL long auto 5 '<signal.mimicMeta JSON>'` |
+| `trade.ts` | Copy an open, or the trader's increase | `npx tsx src/commands/trade.ts '<open or increase signal JSON>'` |
 | `trade.ts` | Open a position (copies nobody) | `npx tsx src/commands/trade.ts SOL long auto 5 manual` |
-| `close.ts` | Close one trader's copy | `npx tsx src/commands/close.ts SOL '<close signal mimicMeta JSON>'` |
+| `close.ts` | Close one trader's copy, or reduce it by the trader's partial close | `npx tsx src/commands/close.ts '<close or decrease signal JSON>'` |
+| `tpsl.ts` | Set/move our TP or SL to the trader's | `npx tsx src/commands/tpsl.ts '<tpsl signal JSON>'` |
 | `close.ts` | Flatten a coin (explicit user request) | `npx tsx src/commands/close.ts SOL manual` |
 
 ## Signal Detection
@@ -136,6 +138,22 @@ In `--wait-for-signal` mode, the Node.js process polls server-side (free) and th
 
 ## Copy Trading Flow
 
+A copy replicates the trader's trade — asset, direction, leverage, entry price,
+TP/SL, increases, partial closes, closes and liquidations — and differs only in
+size, which comes from **our** Hyperliquid equity (5–15%), never the trader's
+dollar amount or account %. All parameters are taken from the monitor's signal
+JSON, never typed separately. Anything that can't be replicated exactly is
+refused rather than approximated:
+
+| Trader does | We do | Refused when |
+|---|---|---|
+| Opens (feed `open`) | `trade.ts`: their coin, side, leverage (isolated); IOC limit ≤ 2% worse than their entry price | price already moved > 2% against their entry; leverage over HL max or ≠ the coin's existing leverage |
+| Opens with TP/SL | Their exact prices as HL position TP/SL after the fill | price not exactly placeable; already crossed; coin position shared with other trades |
+| Adds (`/dex/trade` `increase`) | `trade.ts`: same % of our copy, capped at the tier % of equity (≤ 15%) and 80% of the copy | older than 300s; under $10 |
+| Partial close (`decrease`) | `close.ts`: same % of our copy, reduce-only | under $10 (except a full close) |
+| Sets/moves TP/SL (`tp`/`sl`) | `tpsl.ts`: cancel ours, place theirs | copy isn't the whole coin position; a TP/SL we didn't place; no price given (removal not seen yet) |
+| Closes / TP or SL hit / liquidated | `close.ts`: close the copy (reduce-only) | — (already gone → `already_closed`) |
+
 ```
 Signal detected: @trader opened SOL long 8x
   │
@@ -146,12 +164,14 @@ Signal detected: @trader opened SOL long 8x
   │      └── Size computed in code (src/sizing.ts) from fresh account equity:
   │          initial 5-15% of equity by trader tier (poor 5%, average 7.8/10.4%,
   │          strong 15%; never under HL's $10 minimum, refused under $66.67 equity);
-  │          increases: tier % (≤ 15%) capped at 80% of current position notional
+  │          increases: the trader's add in proportion to our copy, capped at
+  │          tier % (≤ 15%) and 80% of the copy's notional
   │
   ├── 2. Execute on Hyperliquid
-  │      ├── Set leverage (8x isolated)
-  │      ├── Place IOC limit order (+2% slippage, builder fee)
-  │      └── Verify fill
+  │      ├── Set the trader's leverage (8x isolated)
+  │      ├── Place IOC limit order (≤ 2% worse than the trader's entry, builder fee)
+  │      ├── Verify fill
+  │      └── Place the trader's TP/SL (position TP/SL, exact prices)
   │
   ├── 3. Record on Invo
   │      ├── POST /dex/position/create
@@ -159,7 +179,9 @@ Signal detected: @trader opened SOL long 8x
   │      └── Output: sourceBaseShortId (trader's) + positionRecordId (ours)
   │
   └── 4. Monitor for exit
-         └── When trader closes → close.ts with the close signal's mimicMeta
+         ├── Trader adds / reduces / changes TP/SL → trade.ts / close.ts / tpsl.ts
+         │      with that change signal (from /dex/trade; each applied once)
+         └── When trader closes → close.ts with the close signal
                 closes only that trader's copy (matched in data/copy-ledger.json);
                 other copies in the same coin stay open. Unmatched → refused.
                 Open copies are also polled on /dex/trade, so a close is seen
@@ -167,7 +189,7 @@ Signal detected: @trader opened SOL long 8x
                 and record every order as pending before sending it.
 ```
 
-**Exit strategy: mirror the trader.** We close when they close. No independent TP/SL — the whole point of copy trading is trusting the trader's entries AND exits.
+**Exit strategy: mirror the trader.** We close when they close, reduce when they reduce, and use their TP/SL — never one of our own. The whole point of copy trading is trusting the trader's entries AND exits.
 
 ## Credentials Setup
 
@@ -272,7 +294,7 @@ Composite score: `W/L*20 + WinRate*1.5 + P&L*0.01 + Streak*2 - Losses*0.5`
 | Issue | Cause | Fix |
 |-------|-------|-----|
 | `reduce_only: true` was reported to break signing | Phantom agent EIP-712 signature recovery failed | Unconfirmed: the SDK encodes the flag the same either way and its own `marketClose` uses `true`. Opens use `false`; closes use `true` so they can never flip a position. If a close fails with a signer error, it reports `not_filled` with `orderError` |
-| `grouping: 'normalTpsl'` breaks signing | Multi-order grouping causes wrong signer | Always use `grouping: 'na'` |
+| `grouping: 'normalTpsl'` breaks signing | Reported upstream (unconfirmed): multi-order grouping causes wrong signer | Entry/close orders use `'na'`. TP/SL are separate `positionTpsl` orders as the Invo app sends them — not yet confirmed live from this tool; a rejection is reported as `tpsl.error` (non-zero exit) |
 | `"Unknown asset: SOL"` | SDK expects `-PERP` suffix | Use `SOL-PERP`, `BTC-PERP`, etc. (handled in `hl-client.ts`) |
 | `"Price must be divisible by tick size"` | More than 5 significant figures, or more than `6 − szDecimals` decimals | Both limits applied by `limitPrice` in `sizing.ts` (rounded away from mid) |
 | `"Order has invalid size"` | Wrong szDecimals for the asset | Check asset table above |

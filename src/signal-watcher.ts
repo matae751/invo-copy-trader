@@ -21,6 +21,11 @@
 //    maxCloseAttempts; then one close_stuck alert asks for the user.
 //  - Opens/updates are only emitted if the post itself is recent (createdAt):
 //    a newly followed trader's older posts appearing in the feed are not new trades.
+//  - Every change the trader makes to a trade we hold a copy of is passed on
+//    from /dex/trade, so the copy can replicate it: `increase` (only if recent —
+//    an add at a stale price isn't the trader's add), `decrease` (their partial
+//    close) and `tpsl` (their take-profit / stop-loss), in the order they made
+//    them. Each carries an updateId the ledger records, so it is applied once.
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -41,6 +46,8 @@ export interface ClosedTrade {
   baseShortId?: string;
   coin?: string;
   closingPrice?: number | null;
+  /** Why the trader's trade closed: user_closed, take_profit_hit, stop_loss_hit, liquidated. */
+  reasonClosed?: string | null;
   source: 'feed' | 'trade_poll';
   postId?: string;
   catchUp?: boolean;
@@ -291,7 +298,8 @@ export class SignalWatcher {
     for (const w of this.o.watchEntries ?? []) watch.set(w.baseShortId, w);
     for (const c of copies) {
       const id = c.source!.sourcePaperTradeBaseShortId;
-      if (id && !watch.has(id)) watch.set(id, { baseShortId: id, mimicStartedAt: c.openedAt });
+      // From the trader's open, so a TP/SL they set before our copy existed is seen too
+      if (id && !watch.has(id)) watch.set(id, { baseShortId: id, mimicStartedAt: c.traderOpenedAt ?? c.openedAt });
     }
     if (!watch.size) return;
 
@@ -313,6 +321,7 @@ export class SignalWatcher {
       return;
     }
 
+    const changes: { copy: CopyEntry; u: any; updateId: string }[] = [];
     for (const t of trades) {
       const ids = {
         ownerId: typeof t?.creatorAppUserId === 'string' ? t.creatorAppUserId : undefined,
@@ -324,7 +333,7 @@ export class SignalWatcher {
         const updateKey = `${ids.baseShortId ?? ids.baseId}_${u?.investmentId ?? ''}_${u?.updateType ?? ''}_${u?.updatedAt ?? ''}`;
         if (this.seenTrade.has(updateKey)) continue;
         this.seenTrade.add(updateKey);
-        // Informational only (not a signal). On a fresh start, existing updates are just indexed.
+        // Informational. On a fresh start, existing updates are just indexed.
         if (!fresh) {
           out({
             type: 'trade_update', poll: this.pollCount,
@@ -332,12 +341,95 @@ export class SignalWatcher {
             updateType: u?.updateType ?? null, updatedAt: u?.updatedAt ?? null, details: u?.details ?? null,
           });
         }
+        if (!copy) continue;
 
-        if (!isCloseUpdate(u) || !copy) continue;
-        // Sent by emitCloses (and re-sent while the copy stays open) — even on a fresh start
-        this.rememberClose({ ...copyIds(copy), coin: copy.coin, closingPrice: u.details?.closePrice ?? null, source: 'trade_poll', catchUp });
+        if (isCloseUpdate(u)) {
+          // Sent by emitCloses (and re-sent while the copy stays open) — even on a fresh start
+          this.rememberClose({
+            ...copyIds(copy), coin: copy.coin, closingPrice: u.details?.closePrice ?? null,
+            reasonClosed: u.details?.reasonClosed ?? (String(u.updateType).toLowerCase().includes('liquidat') ? 'liquidated' : null),
+            source: 'trade_poll', catchUp,
+          });
+        } else {
+          // Changes to our copy's trade are acted on even on a fresh start: the ledger applies each once
+          changes.push({ copy, u, updateId: updateKey });
+        }
       }
     }
+    // In the order the trader made them
+    changes.sort((a, b) => String(a.u?.updatedAt ?? '').localeCompare(String(b.u?.updatedAt ?? '')));
+    for (const c of changes) this.emitChange(c.copy, c.u, c.updateId, out, err);
+  }
+
+  /** A trader's change to a trade we copied, as an increase / decrease / tpsl signal (or a skip saying why not). */
+  private emitChange(
+    copy: CopyEntry,
+    u: any,
+    updateId: string,
+    out: (d: Record<string, unknown>, signal?: boolean) => void,
+    err: (d: Record<string, unknown>) => void,
+  ) {
+    const type = typeof u?.updateType === 'string' ? u.updateType.toLowerCase() : '';
+    const src = copy.source!;
+    const skip = (reason: string) => err({
+      type: 'skipped', poll: this.pollCount, source: 'trade_poll', updateType: u?.updateType ?? null, updatedAt: u?.updatedAt ?? null,
+      entryId: copy.id, ownerId: src.creatorInvoUserId, coin: copy.coin, reason,
+    });
+    const at = typeof u?.updatedAt === 'string' ? Date.parse(u.updatedAt) : NaN;
+
+    let action: 'increase' | 'decrease' | 'tpsl';
+    let change: Record<string, unknown>;
+    if (type === 'increase' || type === 'decrease') {
+      action = type;
+      change = {
+        positionSizeBefore: u.details?.positionSizeBefore ?? null,
+        positionSizeAfter: u.details?.positionSizeAfter ?? null,
+        positionSizeChange: u.details?.positionSizeChange ?? null,
+      };
+    } else if (type === 'tp' || type === 'sl') {
+      action = 'tpsl';
+      const px = type === 'tp' ? u.details?.priceTarget : u.details?.stopLoss;
+      const before = type === 'tp' ? u.details?.priceTargetBefore : u.details?.stopLossBefore;
+      change = { which: type, triggerPx: px ?? null, ...(before !== undefined && { triggerPxBefore: before }) };
+    } else {
+      skip(`unknown /dex/trade updateType ${JSON.stringify(u?.updateType ?? null)} — not replicated, check it`);
+      return;
+    }
+
+    if (!Number.isFinite(at) || typeof u?.investmentId !== 'string' || !u.investmentId) {
+      skip(`${type} without a readable updatedAt / investmentId — can't be applied exactly once, not replicated`);
+      return;
+    }
+    if (this.closedTradeFor(copyIds(copy))) { skip(`${type} of a trade that is already closed`); return; }
+    if (action !== 'tpsl' && at < Date.parse(copy.openedAt)) {
+      skip(`${type} made before our copy opened (our size is set from our equity at open) — nothing to replicate`);
+      return;
+    }
+    if (action === 'increase') {
+      const maxAgeMs = this.o.maxSignalAgeMs ?? DEFAULT_MAX_SIGNAL_AGE_SEC * 1000;
+      if (this.now - at > maxAgeMs) { skip(`increase made ${Math.round((this.now - at) / 1000)}s ago — too old to copy at today's price`); return; }
+    }
+
+    out({
+      type: 'signal',
+      source: 'trade_poll',
+      poll: this.pollCount,
+      action,
+      copied: true,
+      entryId: copy.id,
+      updateId,
+      investmentId: u.investmentId,
+      updatedAt: u.updatedAt,
+      owner: { id: src.creatorInvoUserId },
+      trade: { coin: copy.coin, side: copy.side },
+      change,
+      mimicMeta: {
+        portfolioId: src.portfolioId,
+        creatorInvoUserId: src.creatorInvoUserId,
+        sourcePaperTradeBaseId: src.sourcePaperTradeBaseId,
+        sourcePaperTradeBaseShortId: src.sourcePaperTradeBaseShortId,
+      },
+    }, true);
   }
 
   /** Remember a trader's close (once per trade). */
@@ -401,6 +493,7 @@ export class SignalWatcher {
         ...(rec.catchUp && rec.attempts === 1 && { catchUp: true }),
         owner: { id: rec.ownerId },
         trade: { coin: copy?.coin ?? rec.coin, ...(copy && { side: copy.side }), isOpen: false, closingPrice: rec.closingPrice ?? null },
+        reasonClosed: rec.reasonClosed ?? null,
         // Identifies the copy for close.ts — from our ledger entry when we have one
         mimicMeta: src
           ? {
@@ -495,6 +588,7 @@ export class SignalWatcher {
         baseShortId: u.baseShortId || undefined,
         coin: u.ticker,
         closingPrice: u.closingPrice ?? null,
+        reasonClosed: u.reasonClosed ?? (u.isLiquidated === true ? 'liquidated' : null),
         source: 'feed',
         postId: post.id,
         catchUp,
@@ -547,6 +641,11 @@ export class SignalWatcher {
           closingPrice: update.closingPrice ?? null,
           entrySize: update.entrySize,
           isOpen: update.isOpen === true,
+          // The trader's TP/SL (null = none set); trade.ts replicates them
+          // (left out if Invo's post doesn't say, so trade.ts refuses rather than assume none)
+          ...('priceTarget' in update && { priceTarget: update.priceTarget }),
+          ...('stopLoss' in update && { stopLoss: update.stopLoss }),
+          openedAt: update.createdAt ?? null,
         },
         portfolio: {
           id: update.portfolio?.id,

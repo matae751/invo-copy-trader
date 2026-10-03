@@ -24,10 +24,13 @@ runCommand(() => withFileLock(`${ledgerPath}.lock`, () => runTrade(process.argv.
     getAccountEquity: () => hl.getAccountEquity(WALLET_ADDRESS),
     setLeverage: hl.setLeverage,
     placeMarketOrder: hl.placeMarketOrder,
+    getOpenOrders: () => hl.getOpenOrders(WALLET_ADDRESS),
+    placePositionTpsl: hl.placePositionTpsl,
+    cancelByCloid: hl.cancelByCloid,
   },
   invo,
   ledger: new FileLedgerStore(ledgerPath),
 })),
-  // Nothing filled (incl. an order HL rejected), fill unknown, or filled but not recorded:
-  // the copy can't be closed by a signal until fixed
-  out => out.status !== 'filled' || !!out.ledger.error);
+  // Nothing filled (incl. an order HL rejected), fill unknown, filled but not recorded (the copy
+  // can't be closed by a signal until fixed), or the trader's TP/SL not fully replicated
+  out => out.status !== 'filled' || !!out.ledger.error || !!out.tpsl?.error);

@@ -40,6 +40,23 @@ export interface CopyEntry {
   closedAt?: string;
   /** Set when the entry was closed by reconciliation rather than by an order. */
   closeReason?: string;
+  /** The leverage copied from the trader (isolated). Absent on older entries. */
+  leverage?: number;
+  /** When the trader opened the trade; the monitor watches its changes from then. Absent on older entries. */
+  traderOpenedAt?: string;
+  /** The trader's TP/SL as replicated on Hyperliquid (position TP/SL orders). */
+  tpsl?: Partial<Record<'tp' | 'sl', TpslState>>;
+}
+
+/** A take-profit or stop-loss copied from the trader. */
+export interface TpslState {
+  triggerPx: number;
+  /** Client order id of our trigger order on Hyperliquid. */
+  cloid: string;
+  /** 'placing' is written before the order is sent; 'active' once HL accepted it. */
+  status: 'placing' | 'active';
+  /** The trader's change it copies (their updatedAt, or the open), so an older change never overrides a newer one. */
+  traderUpdatedAt: string;
 }
 
 /**
@@ -52,7 +69,7 @@ export interface PendingOrder {
   /** Hyperliquid client order id sent with the order. */
   cloid: string;
   requestedQty: number;
-  /** open: the trader update being copied — released again if nothing fills. */
+  /** The trader update being copied (an open, an increase or a decrease) — released again if nothing fills. */
   sourceUpdateId?: string | null;
   placedAt: string;
 }
@@ -112,6 +129,9 @@ export interface OpenIntent {
   cloid: string;
   requestedQty: number;
   now: string;
+  /** New copies only: the trader's leverage and when they opened. */
+  leverage?: number;
+  traderOpenedAt?: string | null;
 }
 
 /**
@@ -162,16 +182,28 @@ export function beginOpen(entries: CopyEntry[], open: OpenIntent): { entries: Co
     pendingOrder,
     openedAt: open.now,
     updatedAt: open.now,
+    ...(open.leverage !== undefined && { leverage: open.leverage }),
+    ...(open.traderOpenedAt && { traderOpenedAt: open.traderOpenedAt }),
   };
   return { entries: [...entries, entry], entryId: entry.id };
 }
 
-/** Record a closing order for `entryId` before it is sent. */
-export function beginClose(entries: CopyEntry[], entryId: string, cloid: string, requestedQty: number, now: string): CopyEntry[] {
+/**
+ * Record a closing order for `entryId` before it is sent. A partial close copying
+ * a trader's decrease claims that update's id now (released if nothing fills).
+ */
+export function beginClose(
+  entries: CopyEntry[], entryId: string, cloid: string, requestedQty: number, now: string, sourceUpdateId: string | null = null,
+): CopyEntry[] {
   return entries.map(e => {
     if (e.id !== entryId) return e;
     if (e.pendingOrder) throw new Error(`ledger entry ${e.id} already has an unsettled order`);
-    return { ...e, pendingOrder: { kind: 'close' as const, cloid, requestedQty, placedAt: now }, updatedAt: now };
+    return {
+      ...e,
+      ...(sourceUpdateId && { sourceUpdateIds: [...(e.sourceUpdateIds ?? []), sourceUpdateId] }),
+      pendingOrder: { kind: 'close' as const, cloid, requestedQty, ...(sourceUpdateId && { sourceUpdateId }), placedAt: now },
+      updatedAt: now,
+    };
   });
 }
 
@@ -202,9 +234,11 @@ export function settleOrder(
 
     if (p.kind === 'close') {
       const left = roundQty(e.qty - filled, szDecimals);
+      // A decrease that filled nothing can be retried: release its update id
+      const ids = filled < eps && p.sourceUpdateId ? e.sourceUpdateIds?.filter(id => id !== p.sourceUpdateId) : e.sourceUpdateIds;
       out.push(left < eps
-        ? { ...rest, qty: 0, status: 'closed', updatedAt: now, closedAt: now }
-        : { ...rest, qty: left, updatedAt: now });
+        ? { ...rest, sourceUpdateIds: ids, qty: 0, status: 'closed', updatedAt: now, closedAt: now }
+        : { ...rest, sourceUpdateIds: ids, qty: left, updatedAt: now });
     } else if (filled < eps) {
       if (e.status === 'pending') continue; // nothing filled: the copy never existed
       out.push({ ...rest, sourceUpdateIds: e.sourceUpdateIds?.filter(id => id !== p.sourceUpdateId), updatedAt: now });
@@ -342,4 +376,25 @@ export function planCopyClose(entry: CopyEntry, entries: CopyEntry[], positionSz
 export function closeAllInCoin(entries: CopyEntry[], coin: string, now: string): CopyEntry[] {
   return entries.map(e =>
     e.status === 'open' && e.coin === coin ? { ...e, qty: 0, status: 'closed', updatedAt: now, closedAt: now } : e);
+}
+
+// --- TP/SL ---
+
+/** Set (or replace) one of an entry's TP/SL records. */
+export function setTpsl(entries: CopyEntry[], entryId: string, which: 'tp' | 'sl', state: TpslState | null, now: string): CopyEntry[] {
+  return entries.map(e => {
+    if (e.id !== entryId) return e;
+    const tpsl = { ...e.tpsl };
+    if (state) tpsl[which] = state;
+    else delete tpsl[which];
+    return { ...e, tpsl, updatedAt: now };
+  });
+}
+
+/** Record that a trader change (e.g. a TP/SL update) was applied to this entry, so it is applied once. */
+export function addSourceUpdate(entries: CopyEntry[], entryId: string, updateId: string, now: string): CopyEntry[] {
+  return entries.map(e =>
+    e.id === entryId && !e.sourceUpdateIds?.includes(updateId)
+      ? { ...e, sourceUpdateIds: [...(e.sourceUpdateIds ?? []), updateId], updatedAt: now }
+      : e);
 }

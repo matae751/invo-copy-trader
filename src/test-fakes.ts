@@ -3,6 +3,7 @@
 
 import type { CopyEntry, LedgerStore } from './copy-ledger.js';
 import type { HlMeta, TradeHl, TradeInvo } from './trade-exec.js';
+import type { OpenOrder } from './tpsl-exec.js';
 
 export class MemoryLedgerStore implements LedgerStore {
   entries: CopyEntry[];
@@ -62,6 +63,9 @@ export function fakeHl(opts: {
   orderFills?: Record<string, number>;
   positionLeverage?: Record<string, { type?: string; value?: number } | undefined>;
   equity?: number;
+  /** Open orders on the account at the start (e.g. TP/SL triggers placed elsewhere). */
+  openOrders?: OpenOrder[];
+  rejectTpsl?: boolean;
 } = {}) {
   const positions: Record<string, number> = { ...opts.positions };
   const mids = { SOL: 100, BTC: 60000, ETH: 3000, ...opts.mids };
@@ -73,10 +77,31 @@ export function fakeHl(opts: {
     Object.keys(positions).map(coin => [coin, { type: 'isolated', value: 5 }]));
   Object.assign(coinLeverage, opts.positionLeverage);
 
+  const openOrders: OpenOrder[] = [...(opts.openOrders ?? [])];
+  const tpslOrders: { coin: string; isLong: boolean; which: 'tp' | 'sl'; triggerPx: number; szDecimals: number; cloid: string }[] = [];
+  const cancels: string[] = [];
+
   const hl: TradeHl & {
     calls: string[]; orders: typeof orders; leverage: typeof leverage; positions: typeof positions; mids: typeof mids; equity: number;
+    openOrders: typeof openOrders; tpslOrders: typeof tpslOrders; cancels: typeof cancels;
   } = {
-    calls, orders, leverage, positions, mids,
+    calls, orders, leverage, positions, mids, openOrders, tpslOrders, cancels,
+    async getOpenOrders() { calls.push('getOpenOrders'); return structuredClone(openOrders); },
+    async placePositionTpsl(coin, isLong, which, triggerPx, szDecimals, cloid) {
+      calls.push(`placePositionTpsl:${which}`);
+      tpslOrders.push({ coin, isLong, which, triggerPx, szDecimals, cloid });
+      if (opts.rejectTpsl) return { status: 'ok', response: { type: 'order', data: { statuses: [{ error: 'Invalid TP/SL price.' }] } } };
+      openOrders.push({ coin, cloid, isTrigger: true, orderType: which === 'tp' ? 'Take Profit Market' : 'Stop Market', triggerPx: String(triggerPx) });
+      return { status: 'ok', response: { type: 'order', data: { statuses: [{ resting: { oid: 7 } }] } } };
+    },
+    async cancelByCloid(coin, cloid) {
+      calls.push(`cancelByCloid:${cloid}`);
+      cancels.push(cloid);
+      const i = openOrders.findIndex(o => o.coin === coin && o.cloid === cloid);
+      if (i < 0) return { status: 'ok', response: { type: 'cancel', data: { statuses: [{ error: 'Order was never placed, already canceled, or filled.' }] } } };
+      openOrders.splice(i, 1);
+      return { status: 'ok', response: { type: 'cancel', data: { statuses: ['success'] } } };
+    },
     equity: opts.equity ?? 784,
     async getAccountEquity() { calls.push('getAccountEquity'); return this.equity; },
     async connect() { calls.push('connect'); },

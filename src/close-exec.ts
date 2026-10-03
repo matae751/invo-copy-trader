@@ -6,7 +6,7 @@
 // Anything that can't be matched is refused before any order is placed.
 // `manual` (explicit user request only) closes the whole coin position.
 
-import { SLIPPAGE_PCT, limitPrice } from './sizing.js';
+import { SLIPPAGE_PCT, MIN_ORDER_NOTIONAL_USD, limitPrice } from './sizing.js';
 import {
   parseCloseIdentity,
   findCopyToClose,
@@ -27,9 +27,11 @@ import {
 import { UsageError, randomCloid, resolveFill, type ExecHl } from './trade-exec.js';
 import { orderRejection } from './hl-response.js';
 import { settlePendingOrders, type SettledOrder } from './pending-orders.js';
+import { isSignalArg, parseTradeSignal, type DecreaseSignal } from './trade-signal.js';
 
 export const MANUAL_CLOSE_ARG = 'manual';
-export const CLOSE_USAGE = `Usage: close <coin> <close signal mimicMeta JSON | ${MANUAL_CLOSE_ARG}>`;
+export const CLOSE_USAGE =
+  `Usage: close '<close or decrease signal JSON>'  |  close <coin> <close signal mimicMeta JSON | ${MANUAL_CLOSE_ARG}>`;
 
 export interface CloseDeps {
   hl: ExecHl;
@@ -38,7 +40,7 @@ export interface CloseDeps {
   now?: () => Date;
 }
 
-type Mode = 'signal' | 'manual';
+type Mode = 'signal' | 'decrease' | 'manual';
 
 export type CloseResult =
   | { status: 'refused'; coin: string; reason: string; entryId?: string; settledPendingOrders?: SettledOrder[] }
@@ -65,9 +67,14 @@ export type CloseResult =
       hlResult: any;
     }
   | {
-      status: 'closed' | 'partial' | 'not_filled';
+      // decreased: a trader's partial close was copied in full (the copy stays open, smaller)
+      status: 'closed' | 'decreased' | 'partial' | 'not_filled';
       coin: string;
       mode: Mode;
+      /** decrease: the fraction of the copy the trader's decrease asks for. */
+      fraction?: number;
+      /** close signals: why the trader's trade closed (user_closed, take_profit_hit, stop_loss_hit, liquidated). */
+      traderReason?: string | null;
       entryId: string | null;
       trader: string | null;
       requestedQty: number;
@@ -155,9 +162,23 @@ class HlSession {
 }
 
 export async function runClose(args: string[], deps: CloseDeps): Promise<CloseResult> {
+  const now = deps.now ?? (() => new Date());
+
+  // The whole signal: a trader's close, or their partial close (decrease)
+  if (args.length === 1 && isSignalArg(args[0])) {
+    let sig;
+    try {
+      sig = parseTradeSignal(args[0]);
+    } catch (e: any) {
+      return refuse('?', e.message);
+    }
+    if (sig.kind === 'close') return signalClose(sig.coin, sig.identity, deps, now, null, sig.reason);
+    if (sig.kind === 'decrease') return signalClose(sig.coin, sig.identity, deps, now, sig, null);
+    return refuse(sig.coin, `close.ts runs close and decrease signals; a ${sig.kind} signal goes to ${sig.kind === 'tpsl' ? 'tpsl.ts' : 'trade.ts'}`);
+  }
+
   const [coin, identityArg] = args;
   if (!coin) throw new UsageError(CLOSE_USAGE);
-  const now = deps.now ?? (() => new Date());
 
   if (identityArg === MANUAL_CLOSE_ARG) return manualClose(coin, deps, now);
 
@@ -171,6 +192,22 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   } catch (e: any) {
     return refuse(coin, e instanceof SyntaxError ? 'close identity is not valid JSON' : e.message);
   }
+  return signalClose(coin, identity, deps, now, null, null);
+}
+
+/**
+ * Close the copy of the trader's trade `identity` in `coin` — all of it, or for a
+ * decrease the same fraction of it the trader closed.
+ */
+async function signalClose(
+  coin: string,
+  identity: CloseIdentity,
+  deps: CloseDeps,
+  now: () => Date,
+  decrease: DecreaseSignal | null,
+  traderReason: string | null,
+): Promise<CloseResult> {
+  const mode: Mode = decrease ? 'decrease' : 'signal';
 
   let entries: CopyEntry[];
   try {
@@ -178,6 +215,10 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   } catch (e: any) {
     return refuse(coin, e.message);
   }
+  // Each trader decrease is copied once
+  const applied = (es: CopyEntry[]) => decrease && es.find(e => e.sourceUpdateIds?.includes(decrease.updateId) && !e.pendingOrder);
+  const done = applied(entries);
+  if (done) return refuse(coin, `trader decrease ${decrease!.updateId} was already copied (ledger entry ${done.id})`, done.id);
 
   // An order an earlier run left unrecorded may be this very copy's: settle it first
   const session = new HlSession(deps, coin, now);
@@ -186,6 +227,8 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   } catch (e: any) {
     return refuse(coin, e.message);
   }
+  const doneAfterSettle = applied(entries);
+  if (doneAfterSettle) return refuse(coin, `trader decrease ${decrease!.updateId} was already copied (ledger entry ${doneAfterSettle.id})`, doneAfterSettle.id, session.settled);
 
   const match = findCopyToClose(entries, coin, identity);
   if (match.kind === 'refuse') {
@@ -196,7 +239,7 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
       return {
         status: 'already_closed',
         coin,
-        mode: 'signal',
+        mode,
         entryId: closedBySettle.entryId,
         reason: `closed by an earlier run's order ${closedBySettle.cloid} (settled now)`,
         reconciledEntryIds: [],
@@ -218,7 +261,7 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
     return {
       status: 'already_closed',
       coin,
-      mode: 'signal',
+      mode,
       entryId: entry.id,
       reason: entries.find(e => e.id === entry.id)!.closeReason!,
       reconciledEntryIds: rec.reconciled,
@@ -226,10 +269,28 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
     };
   }
 
-  const plan = planCopyClose(entry, entries, before.szi, szDecimals);
-  if (plan.kind === 'refuse') return refuse(coin, plan.reason, entry.id, session.settled);
+  const full = planCopyClose(entry, entries, before.szi, szDecimals);
+  if (full.kind === 'refuse') return refuse(coin, full.reason, entry.id, session.settled);
 
   const mid = await midFor(deps.hl, coin);
+  // A decrease closes the trader's fraction of our copy (rounded down to the lot size);
+  // all of it when they closed all (or the remainder rounds to nothing)
+  let plan = full;
+  if (decrease && decrease.fraction < 1) {
+    const qty = floorQty(entry.qty * decrease.fraction, szDecimals);
+    const left = roundQty(entry.qty - qty, szDecimals);
+    if (qty < qtyEpsilon(szDecimals)) {
+      return refuse(coin, `the trader's ${(decrease.fraction * 100).toFixed(2)}% decrease of our ${entry.qty} ${coin} copy rounds to zero at ${szDecimals} decimals`, entry.id, session.settled);
+    }
+    if (left >= qtyEpsilon(szDecimals)) {
+      // Hyperliquid's $10 minimum applies to a partial close: too small can't be replicated
+      if (qty * mid * (1 - SLIPPAGE_PCT) < MIN_ORDER_NOTIONAL_USD) {
+        return refuse(coin, `the trader's ${(decrease.fraction * 100).toFixed(2)}% decrease is ${qty} ${coin} (~$${(qty * mid).toFixed(2)}) of our copy — ` +
+          `below Hyperliquid's $${MIN_ORDER_NOTIONAL_USD} minimum order, so it can't be replicated`, entry.id, session.settled);
+      }
+      plan = { ...full, qty, full: false };
+    }
+  }
   // The price the order will carry must be valid before anything is written or sent
   try {
     limitPrice(mid, !plan.isLong, szDecimals);
@@ -240,7 +301,7 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
 
   // Written before the order is sent, so a lost response is settled by cloid next run
   try {
-    entries = beginClose(entries, entry.id, cloid, plan.qty, now().toISOString());
+    entries = beginClose(entries, entry.id, cloid, plan.qty, now().toISOString(), decrease?.updateId ?? null);
     deps.ledger.save(entries);
   } catch (e: any) {
     return refuse(coin, `ledger write failed: ${e.message}`, entry.id, session.settled);
@@ -260,7 +321,7 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   const filled = await resolveFill(deps.hl, hlResult, cloid, requestFailed);
   if (filled === null) {
     return {
-      status: 'unknown', coin, mode: 'signal', entryId: entry.id, cloid, hlResult,
+      status: 'unknown', coin, mode, entryId: entry.id, cloid, hlResult,
       reason: `${orderError ?? 'order response unreadable'}; fill unknown — the next ${coin} trade/close settles it`,
     };
   }
@@ -271,6 +332,7 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   // This copy was the whole position and it's now flat: nothing of it is left, even if the
   // position had shrunk below the ledger's qty beforehand
   const flat = after !== null && Math.abs(after.szi) < qtyEpsilon(szDecimals);
+  const wholeCopy = plan.qty >= entry.qty - qtyEpsilon(szDecimals);
   const copyGone = plan.full && flat;
   const ledgerQty = copyGone ? entry.qty : closedQty;
 
@@ -286,9 +348,14 @@ export async function runClose(args: string[], deps: CloseDeps): Promise<CloseRe
   }
 
   return {
-    status: copyGone ? 'closed' : closedQty <= 0 ? 'not_filled' : closedQty < plan.qty - qtyEpsilon(szDecimals) ? 'partial' : 'closed',
+    status: copyGone ? 'closed'
+      : closedQty <= 0 ? 'not_filled'
+      : closedQty < plan.qty - qtyEpsilon(szDecimals) ? 'partial'
+      : wholeCopy ? 'closed' : 'decreased',
     coin,
-    mode: 'signal',
+    mode,
+    ...(decrease && { fraction: decrease.fraction }),
+    ...(mode === 'signal' && { traderReason }),
     entryId: entry.id,
     trader: entry.source!.creatorInvoUserId,
     requestedQty: plan.qty,
