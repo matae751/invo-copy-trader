@@ -49,10 +49,17 @@ interface ChangeBase {
   updatedAt: string;
 }
 
-/** The trader added to the trade: their position grew by `ratio` (change / size before). */
-export interface IncreaseSignal extends ChangeBase { kind: 'increase'; ratio: number; investmentId: string }
-/** The trader reduced the trade by `fraction` of it (change / size before, at most 1). */
-export interface DecreaseSignal extends ChangeBase { kind: 'decrease'; fraction: number }
+/**
+ * The trader added to the trade: their position grew by `ratio`, in coins (see
+ * notionalRatio). `positionSizeRatio` is /dex/trade's figure, kept for reference only.
+ */
+export interface IncreaseSignal extends ChangeBase { kind: 'increase'; ratio: number; positionSizeRatio: number; investmentId: string }
+/** The trader reduced the trade by `fraction` of it, in coins (at most 1; see notionalRatio). */
+export interface DecreaseSignal extends ChangeBase { kind: 'decrease'; fraction: number; positionSizeRatio: number }
+
+/** Tolerances for the $ figures to reconcile with Invo's own after-change numbers. */
+export const INCREASE_RECONCILE_TOLERANCE = 0.001; // 0.1% — matched to 0.000% on every live increase
+export const DECREASE_RECONCILE_TOLERANCE = 0.01; // 1% — live decreases matched within 0.7%
 /** The trader set (or moved) their take-profit or stop-loss. */
 export interface TpslSignal extends ChangeBase { kind: 'tpsl'; which: TpslKind; triggerPx: number }
 /** The trader closed the trade (closed by them, TP/SL hit or liquidated). */
@@ -116,6 +123,62 @@ function sizeChange(change: any): { before: number; after: number; delta: number
   return { before, after, delta };
 }
 
+/**
+ * How much the trader's position changed, in coins, from the feed post's $ figures
+ * (change.notional). /dex/trade's positionSize is a share of the trader's portfolio
+ * value at that moment, so its ratio drifts when their portfolio value changes —
+ * it is never used for sizing.
+ *   increase: coins before = entrySimBefore / entryPriceBefore, coins added =
+ *             simDifference / livePriceAtChange → ratio = added / before. Must
+ *             reproduce Invo's entrySimAfter and new average entry (entryPriceAfter).
+ *   decrease: fraction = simDifference / entrySimBefore (both at the entry price).
+ *             Must reproduce entrySimAfter.
+ * Throws when the figures are missing or don't reconcile.
+ */
+export function notionalRatio(kind: 'increase' | 'decrease', notional: any, investmentId: string | null): number {
+  if (!notional || typeof notional !== 'object') {
+    throw new Error(`${kind} signal has no change.notional ($ figures from the trader's feed post) — positionSize alone can't size it exactly`);
+  }
+  const n = notional;
+  if (investmentId !== null && n.investmentId !== investmentId) {
+    throw new Error(`${kind} signal's $ figures are for change ${JSON.stringify(n.investmentId ?? null)}, not ${investmentId}`);
+  }
+  if (n.simIncrease !== (kind === 'increase')) throw new Error(`${kind} signal's $ figures describe ${n.simIncrease ? 'an increase' : 'a decrease'}`);
+  if (!positive(n.entrySimBefore) || !positive(n.simDifference)) {
+    throw new Error(`${kind} signal has no usable entrySimBefore / simDifference (got ${JSON.stringify([n.entrySimBefore ?? null, n.simDifference ?? null])})`);
+  }
+  if (typeof n.entrySimAfter !== 'number' || !Number.isFinite(n.entrySimAfter)) {
+    throw new Error(`${kind} signal has no entrySimAfter to check its $ figures against`);
+  }
+  const off = (a: number, b: number) => Math.abs(a - b) / Math.max(Math.abs(b), 1e-12);
+
+  if (kind === 'increase') {
+    if (!positive(n.entryPriceBefore) || !positive(n.livePriceAtChange) || !positive(n.entryPriceAfter)) {
+      throw new Error(`increase signal has no usable entryPriceBefore / livePriceAtChange / entryPriceAfter (got ${
+        JSON.stringify([n.entryPriceBefore ?? null, n.livePriceAtChange ?? null, n.entryPriceAfter ?? null])})`);
+    }
+    const coinsBefore = n.entrySimBefore / n.entryPriceBefore;
+    const coinsAdded = n.simDifference / n.livePriceAtChange;
+    const simAfter = n.entrySimBefore + n.simDifference;
+    const avgEntry = simAfter / (coinsBefore + coinsAdded);
+    if (off(n.entrySimAfter, simAfter) > INCREASE_RECONCILE_TOLERANCE || off(avgEntry, n.entryPriceAfter) > INCREASE_RECONCILE_TOLERANCE) {
+      throw new Error(`increase signal's $ figures don't reconcile with Invo's (entrySim ${simAfter} vs ${n.entrySimAfter}, ` +
+        `average entry ${avgEntry} vs ${n.entryPriceAfter}) — can't tell how much the trader added`);
+    }
+    return coinsAdded / coinsBefore;
+  }
+
+  if (n.simDifference > n.entrySimBefore * (1 + DECREASE_RECONCILE_TOLERANCE)) {
+    throw new Error(`decrease signal removes $${n.simDifference} of a $${n.entrySimBefore} trade`);
+  }
+  const simAfter = Math.max(0, n.entrySimBefore - n.simDifference);
+  if (Math.abs(n.entrySimAfter - simAfter) > DECREASE_RECONCILE_TOLERANCE * n.entrySimBefore) {
+    throw new Error(`decrease signal's $ figures don't reconcile with Invo's (entrySim after ${simAfter} vs ${n.entrySimAfter}) — ` +
+      `can't tell how much the trader closed`);
+  }
+  return Math.min(1, n.simDifference / n.entrySimBefore);
+}
+
 /** Parse a monitor signal (JSON). Throws on anything that isn't fully specified. */
 export function parseTradeSignal(arg: string): TradeSignal {
   let sig: any;
@@ -155,13 +218,18 @@ export function parseTradeSignal(arg: string): TradeSignal {
       const { before, after, delta } = sizeChange(sig.change);
       if (!(after > before)) throw new Error(`increase signal whose position didn't grow (${before} → ${after})`);
       if (!nonEmpty(sig.investmentId)) throw new Error('increase signal has no investmentId');
-      return { kind: 'increase', ...base, ratio: delta / before, investmentId: sig.investmentId.trim() };
+      const investmentId = sig.investmentId.trim();
+      const ratio = notionalRatio('increase', sig.change?.notional, investmentId);
+      return { kind: 'increase', ...base, ratio, positionSizeRatio: delta / before, investmentId };
     }
     case 'decrease': {
       const base = changeBase(sig);
       const { before, after, delta } = sizeChange(sig.change);
       if (!(after < before)) throw new Error(`decrease signal whose position didn't shrink (${before} → ${after})`);
-      return { kind: 'decrease', ...base, fraction: Math.min(1, delta / before) };
+      if (!nonEmpty(sig.investmentId)) throw new Error('decrease signal has no investmentId');
+      // Down to nothing is a full close of the copy, whatever the $ figures say
+      const fraction = after === 0 ? 1 : notionalRatio('decrease', sig.change?.notional, sig.investmentId.trim());
+      return { kind: 'decrease', ...base, fraction, positionSizeRatio: delta / before };
     }
     case 'tpsl': {
       const base = changeBase(sig);

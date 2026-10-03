@@ -7,7 +7,7 @@ import { runTrade } from './trade-exec.js';
 import { runClose } from './close-exec.js';
 import { runTpsl } from './tpsl-exec.js';
 import { entryBoundPx, assertExactPerpPrice, assertTriggerSide } from './sizing.js';
-import { MemoryLedgerStore, fakeHl, fakeInvo, signalMeta, copyEntry } from './test-fakes.js';
+import { MemoryLedgerStore, fakeHl, fakeInvo, signalMeta, copyEntry, notionalFor } from './test-fakes.js';
 import type { CopyEntry } from './copy-ledger.js';
 
 const NOW = new Date('2026-10-02T12:00:00Z');
@@ -43,7 +43,7 @@ const tpslSig = (which: 'tp' | 'sl', triggerPx: number | null, updatedAt = '2026
 const decreaseSig = (before: number, after: number, updatedAt = '2026-10-02T11:59:50.000Z', trader = 'alice', tradeId = 't1') => JSON.stringify({
   type: 'signal', source: 'trade_poll', action: 'decrease', updateId: `${tradeId}_dec_${updatedAt}`, investmentId: 'inv', updatedAt,
   trade: { coin: 'SOL', side: 'long' },
-  change: { positionSizeBefore: before, positionSizeAfter: after, positionSizeChange: before - after },
+  change: { positionSizeBefore: before, positionSizeAfter: after, positionSizeChange: before - after, notional: notionalFor('decrease', (before - after) / before, 'inv') },
   mimicMeta: ident(trader, tradeId),
 });
 const closeSig = (reasonClosed: string, trader = 'alice', tradeId = 't1') => JSON.stringify({

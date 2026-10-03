@@ -204,3 +204,26 @@ export function copyEntry(id: string, coin: string, qty: number, trader: string 
     updatedAt: '2026-10-01T00:00:00.000Z',
   };
 }
+
+/**
+ * $ figures for a trader's change (as the feed post for it carries them) that
+ * reconcile like live ones: an increase by `ratio` in coins (entry and change at
+ * `px`), or a decrease by `ratio` of the trade.
+ */
+export function notionalFor(kind: 'increase' | 'decrease', ratio: number, investmentId: string, px = 100) {
+  const entrySimBefore = 100;
+  if (kind === 'decrease') {
+    const simDifference = entrySimBefore * ratio;
+    return {
+      investmentId, postId: `post-${investmentId}`, simIncrease: false, entrySimBefore, simDifference,
+      entryPriceBefore: null, livePriceAtChange: px, entrySimAfter: entrySimBefore - simDifference, entryPriceAfter: px,
+    };
+  }
+  const coinsBefore = entrySimBefore / px;
+  const simDifference = coinsBefore * ratio * px;
+  const entrySimAfter = entrySimBefore + simDifference;
+  return {
+    investmentId, postId: `post-${investmentId}`, simIncrease: true, entrySimBefore, simDifference,
+    entryPriceBefore: px, livePriceAtChange: px, entrySimAfter, entryPriceAfter: entrySimAfter / (coinsBefore * (1 + ratio)),
+  };
+}

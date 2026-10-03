@@ -147,10 +147,10 @@ refused rather than approximated:
 
 | Trader does | We do | Refused when |
 |---|---|---|
-| Opens (feed `open`) | `trade.ts`: their coin, side, leverage (isolated); IOC limit ≤ 2% worse than their entry price | posted > 300s ago (or no post time); price already moved > 2% against their entry; leverage over HL max or ≠ the coin's existing leverage; any trigger/TP/SL order in the coin |
+| Opens (feed `open`) | `trade.ts`: their coin, side, leverage (isolated); IOC limit ≤ 2% worse than their entry price; size clamped so all active copies stay within 80% of equity | posted > 300s ago (or no post time); price already moved > 2% against their entry; leverage over HL max or ≠ the coin's existing leverage; any trigger/TP/SL order in the coin |
 | Opens with TP/SL | Their exact prices as HL position TP/SL after the fill | price not exactly placeable; already crossed; coin position shared with other trades |
-| Adds (`/dex/trade` `increase`) | `trade.ts`: same % of our copy, capped at the tier % of equity (≤ 15%), the room left under 15% of equity for the whole copy, and 80% of the copy (or coin position, if smaller) | older than 300s; copy already at 15% of equity; under $10 |
-| Partial close (`decrease`) | `close.ts`: same % of our copy, reduce-only | under $10 (except a full close); live position smaller than the copies tracked in it |
+| Adds (`/dex/trade` `increase`) | `trade.ts`: same % of our copy (in coins, from the $ figures in Invo's feed post for the change), capped at the room left under 80% of equity for all active copies, and at the tier % of equity (≤ 15%), the room left under 15% of equity for the whole copy, and 80% of the copy (or coin position, if smaller) | older than 300s; copy already at 15% of equity; under $10 |
+| Partial close (`decrease`) | `close.ts`: same % of our copy (from the $ figures in Invo's feed post for the change), reduce-only | under $10 (except a full close); live position smaller than the copies tracked in it; no feed post with $ figures within 120s, or figures that don't reconcile (adds too) |
 | Sets/moves TP/SL (`tp`/`sl`) | `tpsl.ts`: cancel ours, place theirs | copy isn't the whole coin position; a TP/SL we didn't place; no price given (removal not seen yet) |
 | Closes / TP or SL hit / liquidated | `close.ts`: close the copy (reduce-only) | — (already gone → `already_closed`) |
 

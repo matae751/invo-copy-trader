@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runTrade, UsageError } from './trade-exec.js';
 import { runClose } from './close-exec.js';
-import { MemoryLedgerStore, fakeHl, fakeInvo, signalMeta, copyEntry } from './test-fakes.js';
+import { MemoryLedgerStore, fakeHl, fakeInvo, signalMeta, copyEntry, notionalFor } from './test-fakes.js';
 
 let ids = 0;
 type HlOpts = NonNullable<Parameters<typeof fakeHl>[0]>;
@@ -34,7 +34,8 @@ function openSignal(coin: string, side: 'long' | 'short', leverage: number, trad
 /** trade.ts's argument for a /dex/trade increase of `trader`'s trade: their position grew by `ratio`. */
 const increase = (trader: string, tradeId: string, ratio: number, updatedAt = '2026-10-02T11:59:00.000Z', coin = 'SOL') => [JSON.stringify({
   type: 'signal', source: 'trade_poll', action: 'increase', updateId: `${tradeId}_inv-${updatedAt}_increase`, investmentId: `inv-${updatedAt}`, updatedAt,
-  trade: { coin, side: 'long' }, change: { positionSizeBefore: 0.1, positionSizeAfter: 0.1 * (1 + ratio), positionSizeChange: 0.1 * ratio },
+  trade: { coin, side: 'long' },
+  change: { positionSizeBefore: 0.1, positionSizeAfter: 0.1 * (1 + ratio), positionSizeChange: 0.1 * ratio, notional: notionalFor('increase', ratio, `inv-${updatedAt}`) },
   mimicMeta: { ...signalMeta(trader, tradeId), initialSourcePaperUpdateId: undefined },
 })];
 

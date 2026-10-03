@@ -71,8 +71,10 @@ export type CloseResult =
       status: 'closed' | 'decreased' | 'partial' | 'not_filled';
       coin: string;
       mode: Mode;
-      /** decrease: the fraction of the copy the trader's decrease asks for. */
+      /** decrease: the fraction of the copy the trader's decrease asks for (from their $ figures). */
       fraction?: number;
+      /** decrease: /dex/trade's positionSize ratio — reference only, not used for sizing. */
+      positionSizeRatio?: number;
       /** close signals: why the trader's trade closed (user_closed, take_profit_hit, stop_loss_hit, liquidated). */
       traderReason?: string | null;
       entryId: string | null;
@@ -370,7 +372,7 @@ async function signalClose(
       : wholeCopy ? 'closed' : 'decreased',
     coin,
     mode,
-    ...(decrease && { fraction: decrease.fraction }),
+    ...(decrease && { fraction: decrease.fraction, positionSizeRatio: decrease.positionSizeRatio }),
     ...(mode === 'signal' && { traderReason }),
     entryId: entry.id,
     trader: entry.source!.creatorInvoUserId,

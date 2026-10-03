@@ -26,6 +26,19 @@
 //    an add at a stale price isn't the trader's add), `decrease` (their partial
 //    close) and `tpsl` (their take-profit / stop-loss), in the order they made
 //    them. Each carries an updateId the ledger records, so it is applied once.
+//  - An increase/decrease is held until the feed post for it arrives (matched
+//    exactly: post update.id == the change's investmentId) and is sent with that
+//    post's $ figures (entrySim, simDifference, prices), which the size ratio is
+//    computed from. /dex/trade's positionSize is a share of the trader's portfolio
+//    value at that moment, so its ratio drifts when their portfolio value changes
+//    (seen live: 2.07 reported for a 1.29× add). No post within notionalWaitMs
+//    (default 120s) → the change is not replicated, never sized from positionSize.
+//  - A change to a copied trade that can't be replicated (no post with $ figures,
+//    a post that doesn't match, a stale add, an unknown or unreadable change) is
+//    reported on stdout as `change_not_replicated` and ends --wait-for-signal, so
+//    the user hears that the copy no longer matches the trader. Changes there is
+//    nothing to replicate for (copy gone, trade closed, made before our copy) stay
+//    quiet stderr `skipped` lines.
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -58,12 +71,48 @@ export interface ClosedTrade {
   gaveUp?: boolean;
 }
 
+/**
+ * A trader's increase/decrease in $, from the feed post for it (post update.id ==
+ * the /dex/trade change's investmentId). Verified live: for increases the coin
+ * ratio these give reproduces Invo's new average entry price exactly.
+ */
+export interface ChangeNotional {
+  investmentId: string;
+  ownerId: string;
+  baseId: string | null;
+  baseShortId: string | null;
+  postId: string;
+  simIncrease: boolean;
+  /** $ of the trade before the change, at its entry price (changes.entrySim). */
+  entrySimBefore: number;
+  /** $ added (at livePriceAtChange) or removed. */
+  simDifference: number;
+  /** Average entry before the change (changes.entryPrice — present on increases). */
+  entryPriceBefore: number | null;
+  livePriceAtChange: number | null;
+  /** $ and average entry after the change (the post's update.entrySim / entryPrice). */
+  entrySimAfter: number | null;
+  entryPriceAfter: number | null;
+  seenAt: number;
+}
+
+/** An increase/decrease waiting for the feed post with its $ figures. */
+export interface PendingChange {
+  entryId: string;
+  updateId: string;
+  update: any;
+  seenAt: number;
+}
+
 export interface MonitorState {
   version: 1;
   seenPostIds: string[];
   seenTradeUpdates: string[];
   /** Absent in state saved before closes were remembered. */
   closedTrades?: ClosedTrade[];
+  /** Absent in state saved before changes were sized from feed posts. */
+  changeNotionals?: ChangeNotional[];
+  pendingChanges?: PendingChange[];
   savedAt: number;
 }
 
@@ -84,7 +133,9 @@ export class FileStateStore implements StateStore {
     if (!existsSync(this.path)) return null;
     const data = JSON.parse(readFileSync(this.path, 'utf8'));
     if (!Array.isArray(data?.seenPostIds) || !Array.isArray(data?.seenTradeUpdates) || typeof data?.savedAt !== 'number' ||
-        (data.closedTrades !== undefined && !Array.isArray(data.closedTrades))) {
+        (data.closedTrades !== undefined && !Array.isArray(data.closedTrades)) ||
+        (data.changeNotionals !== undefined && !Array.isArray(data.changeNotionals)) ||
+        (data.pendingChanges !== undefined && !Array.isArray(data.pendingChanges))) {
       throw new Error(`monitor state ${this.path} is malformed`);
     }
     return data;
@@ -133,6 +184,8 @@ export interface WatcherOptions {
   maxCloseAttempts?: number;
   /** How long a closed trade is remembered (for a copy that appears late). */
   closedTradeRetentionMs?: number;
+  /** How long an increase/decrease waits for the feed post with its $ figures before it is skipped. */
+  notionalWaitMs?: number;
 }
 
 export interface WatchEvent {
@@ -151,6 +204,11 @@ export const DEFAULT_MAX_SIGNAL_AGE_SEC = 300;
 export const DEFAULT_CLOSE_RETRY_SEC = 90;
 export const DEFAULT_MAX_CLOSE_ATTEMPTS = 10;
 export const DEFAULT_CLOSED_TRADE_RETENTION_SEC = 24 * 3600;
+/** Feed posts for changes were seen ~6s after the change; 120s leaves room for a slow feed. */
+export const DEFAULT_NOTIONAL_WAIT_SEC = 120;
+const MAX_NOTIONALS = 500;
+
+const finiteOrNull = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 interface TradeIds {
   ownerId: string;
@@ -203,6 +261,8 @@ export class SignalWatcher {
   private seenPosts = new Set<string>();
   private seenTrade = new Set<string>();
   private closed: ClosedTrade[] = [];
+  private notionals = new Map<string, ChangeNotional>();
+  private pending: PendingChange[] = [];
   /** Closed trades first seen in the current poll. */
   private closedThisPoll = new Set<ClosedTrade>();
   private started = false;
@@ -236,6 +296,8 @@ export class SignalWatcher {
         saved.seenPostIds.forEach(id => this.seenPosts.add(id));
         saved.seenTradeUpdates.forEach(k => this.seenTrade.add(k));
         this.closed = saved.closedTrades ?? [];
+        for (const n of saved.changeNotionals ?? []) this.notionals.set(n.investmentId, n);
+        this.pending = saved.pendingChanges ?? [];
         gapMs = Math.max(0, this.now - saved.savedAt);
       }
     }
@@ -257,6 +319,7 @@ export class SignalWatcher {
 
     await this.pollTradeUpdates(copies, fresh, first && !fresh, out, err);
     await this.pollFeed({ first, fresh, gapMs, maxCatchUpMs, isCopied, ledgerReadable }, out, err);
+    if (ledgerReadable) this.emitPendingChanges(copies, out, err);
     this.emitCloses(copies, ledgerReadable, out);
 
     try {
@@ -266,6 +329,8 @@ export class SignalWatcher {
         seenPostIds: [...this.seenPosts].slice(-keep),
         seenTradeUpdates: [...this.seenTrade].slice(-keep),
         closedTrades: this.closed,
+        changeNotionals: [...this.notionals.values()].sort((a, b) => a.seenAt - b.seenAt).slice(-MAX_NOTIONALS),
+        pendingChanges: this.pending,
         savedAt: this.now,
       });
     } catch (e: any) {
@@ -358,7 +423,129 @@ export class SignalWatcher {
     }
     // In the order the trader made them
     changes.sort((a, b) => String(a.u?.updatedAt ?? '').localeCompare(String(b.u?.updatedAt ?? '')));
-    for (const c of changes) this.emitChange(c.copy, c.u, c.updateId, out, err);
+    for (const c of changes) {
+      const type = typeof c.u?.updateType === 'string' ? c.u.updateType.toLowerCase() : '';
+      if (type === 'increase' || type === 'decrease') {
+        // Sized from the feed post for it: wait for that (emitPendingChanges)
+        if (!this.pending.some(p => p.updateId === c.updateId)) {
+          this.pending.push({ entryId: c.copy.id, updateId: c.updateId, update: c.u, seenAt: this.now });
+        }
+      } else {
+        this.emitChange(c.copy, c.u, c.updateId, out, err);
+      }
+    }
+  }
+
+  /** Remember the $ figures of every change post in the feed (see ChangeNotional). */
+  private indexChangeNotionals(posts: any[]) {
+    for (const p of posts) {
+      const u = p?.update;
+      const c = u?.changes;
+      if (!u || !c || typeof c !== 'object' || p.repostId != null) continue;
+      if (typeof u.id !== 'string' || !u.id || typeof u.owner?.id !== 'string') continue;
+      if (p.owner?.id && p.owner.id !== u.owner.id) continue;
+      const before = finiteOrNull(c.entrySim);
+      const diff = finiteOrNull(c.simDifference);
+      if (before === null || diff === null || typeof c.simIncrease !== 'boolean') continue;
+      this.notionals.set(u.id, {
+        investmentId: u.id,
+        ownerId: u.owner.id,
+        baseId: u.baseId || null,
+        baseShortId: u.baseShortId || null,
+        postId: p.id,
+        simIncrease: c.simIncrease,
+        entrySimBefore: before,
+        simDifference: diff,
+        entryPriceBefore: finiteOrNull(c.entryPrice),
+        livePriceAtChange: finiteOrNull(c.livePriceAtChange),
+        entrySimAfter: finiteOrNull(u.entrySim),
+        entryPriceAfter: finiteOrNull(u.entryPrice),
+        seenAt: this.now,
+      });
+    }
+  }
+
+  /**
+   * The trader changed a trade we copied and the copy can't follow: stdout, and it ends
+   * --wait-for-signal (a quiet skip would leave the copy diverging unnoticed).
+   */
+  private notReplicated(copy: CopyEntry, u: any, reason: string, out: (d: Record<string, unknown>, signal?: boolean) => void) {
+    const type = typeof u?.updateType === 'string' ? u.updateType.toLowerCase() : '';
+    const action = type === 'increase' ? 'add' : type === 'decrease' ? 'partial close' : `change (${u?.updateType ?? 'unknown'})`;
+    const src = copy.source;
+    const username = src ? this.o.registry.byUserId.get(src.creatorInvoUserId)?.username ?? null : null;
+    const who = username ? `@${username}` : `trader ${src?.creatorInvoUserId ?? '?'}`;
+    const d = u?.details ?? {};
+    const sizes = ['positionSizeBefore', 'positionSizeAfter', 'positionSizeChange'].every(k => typeof d[k] === 'number');
+    out({
+      type: 'change_not_replicated',
+      poll: this.pollCount,
+      action,
+      orderSent: false,
+      message: `NOT REPLICATED — ${who}'s ${action} on ${copy.coin} (trade ${src?.sourcePaperTradeBaseShortId ?? '?'}): ${reason}. ` +
+        `No order was sent; our copy stays ${copy.qty} ${copy.coin} ${copy.side}, which may no longer match the trader's position.`,
+      reason,
+      trader: {
+        id: src?.creatorInvoUserId ?? null,
+        username,
+        portfolioId: src?.portfolioId ?? null,
+        tradeBaseId: src?.sourcePaperTradeBaseId ?? null,
+        tradeBaseShortId: src?.sourcePaperTradeBaseShortId ?? null,
+      },
+      coin: copy.coin,
+      side: copy.side,
+      change: {
+        updateType: u?.updateType ?? null,
+        updatedAt: u?.updatedAt ?? null,
+        investmentId: u?.investmentId ?? null,
+        // As /dex/trade reports them: a share of the trader's portfolio value, not a size — shown, never sized from
+        ...(sizes && { traderPositionShareBefore: d.positionSizeBefore, traderPositionShareAfter: d.positionSizeAfter }),
+      },
+      // Our copy as the ledger records it, unchanged (coin units)
+      copy: { entryId: copy.id, qty: copy.qty, status: copy.status },
+    }, true);
+  }
+
+  /**
+   * Send each waiting increase/decrease whose feed post has arrived, with its $ figures.
+   * One whose post doesn't come within notionalWaitMs is skipped: it can't be sized exactly.
+   */
+  private emitPendingChanges(
+    copies: CopyEntry[],
+    out: (d: Record<string, unknown>, signal?: boolean) => void,
+    err: (d: Record<string, unknown>) => void,
+  ) {
+    const waitMs = this.o.notionalWaitMs ?? DEFAULT_NOTIONAL_WAIT_SEC * 1000;
+    const keep: PendingChange[] = [];
+    const ordered = [...this.pending].sort((a, b) => String(a.update?.updatedAt ?? '').localeCompare(String(b.update?.updatedAt ?? '')));
+    for (const p of ordered) {
+      const u = p.update;
+      const copy = copies.find(c => c.id === p.entryId);
+      const skip = (reason: string) => err({
+        type: 'skipped', poll: this.pollCount, source: 'trade_poll', updateType: u?.updateType ?? null, updatedAt: u?.updatedAt ?? null,
+        entryId: p.entryId, ownerId: copy?.source?.creatorInvoUserId ?? null, coin: copy?.coin ?? null, reason,
+      });
+      if (!copy) { skip(`${u?.updateType} of a copy that is no longer open — nothing to replicate`); continue; }
+      const n = this.notionals.get(u?.investmentId);
+      if (!n) {
+        if (this.now - p.seenAt > waitMs) {
+          this.notReplicated(copy, u, `${u?.updateType}: no feed post with its $ figures within ${Math.round(waitMs / 1000)}s — ` +
+            `/dex/trade's positionSize alone can't size it exactly, not replicated`, out);
+        } else {
+          keep.push(p);
+        }
+        continue;
+      }
+      const src = copy.source!;
+      const wantIncrease = String(u?.updateType).toLowerCase() === 'increase';
+      if (n.ownerId !== src.creatorInvoUserId || (n.baseId && src.sourcePaperTradeBaseId && n.baseId !== src.sourcePaperTradeBaseId) ||
+          n.simIncrease !== wantIncrease) {
+        this.notReplicated(copy, u, `${u?.updateType}: the feed post for it (${n.postId}) is for another trader, trade or kind of change — not replicated`, out);
+        continue;
+      }
+      this.emitChange(copy, u, p.updateId, out, err, n);
+    }
+    this.pending = keep;
   }
 
   /** A trader's change to a trade we copied, as an increase / decrease / tpsl signal (or a skip saying why not). */
@@ -368,6 +555,7 @@ export class SignalWatcher {
     updateId: string,
     out: (d: Record<string, unknown>, signal?: boolean) => void,
     err: (d: Record<string, unknown>) => void,
+    notional?: ChangeNotional,
   ) {
     const type = typeof u?.updateType === 'string' ? u.updateType.toLowerCase() : '';
     const src = copy.source!;
@@ -385,6 +573,20 @@ export class SignalWatcher {
         positionSizeBefore: u.details?.positionSizeBefore ?? null,
         positionSizeAfter: u.details?.positionSizeAfter ?? null,
         positionSizeChange: u.details?.positionSizeChange ?? null,
+        // What the size is computed from (see ChangeNotional)
+        notional: notional
+          ? {
+              investmentId: notional.investmentId,
+              postId: notional.postId,
+              simIncrease: notional.simIncrease,
+              entrySimBefore: notional.entrySimBefore,
+              simDifference: notional.simDifference,
+              entryPriceBefore: notional.entryPriceBefore,
+              livePriceAtChange: notional.livePriceAtChange,
+              entrySimAfter: notional.entrySimAfter,
+              entryPriceAfter: notional.entryPriceAfter,
+            }
+          : null,
       };
     } else if (type === 'tp' || type === 'sl') {
       action = 'tpsl';
@@ -392,12 +594,12 @@ export class SignalWatcher {
       const before = type === 'tp' ? u.details?.priceTargetBefore : u.details?.stopLossBefore;
       change = { which: type, triggerPx: px ?? null, ...(before !== undefined && { triggerPxBefore: before }) };
     } else {
-      skip(`unknown /dex/trade updateType ${JSON.stringify(u?.updateType ?? null)} — not replicated, check it`);
+      this.notReplicated(copy, u, `unknown /dex/trade updateType ${JSON.stringify(u?.updateType ?? null)} — not replicated, check it`, out);
       return;
     }
 
     if (!Number.isFinite(at) || typeof u?.investmentId !== 'string' || !u.investmentId) {
-      skip(`${type} without a readable updatedAt / investmentId — can't be applied exactly once, not replicated`);
+      this.notReplicated(copy, u, `${type} without a readable updatedAt / investmentId — can't be applied exactly once, not replicated`, out);
       return;
     }
     if (this.closedTradeFor(copyIds(copy))) { skip(`${type} of a trade that is already closed`); return; }
@@ -407,7 +609,10 @@ export class SignalWatcher {
     }
     if (action === 'increase') {
       const maxAgeMs = this.o.maxSignalAgeMs ?? DEFAULT_MAX_SIGNAL_AGE_SEC * 1000;
-      if (this.now - at > maxAgeMs) { skip(`increase made ${Math.round((this.now - at) / 1000)}s ago — too old to copy at today's price`); return; }
+      if (this.now - at > maxAgeMs) {
+        this.notReplicated(copy, u, `increase made ${Math.round((this.now - at) / 1000)}s ago — too old to copy at today's price, not replicated`, out);
+        return;
+      }
     }
 
     out({
@@ -547,6 +752,7 @@ export class SignalWatcher {
       return;
     }
     posts.forEach(p => this.seenPosts.add(p.id));
+    this.indexChangeNotionals(posts);
     if (ctx.fresh) return; // first ever run: existing posts are not new signals
 
     const catchUp = ctx.first; // posts made while this monitor wasn't running

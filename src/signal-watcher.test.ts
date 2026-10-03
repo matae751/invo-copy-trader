@@ -4,7 +4,7 @@ import { SignalWatcher, DEFAULT_CLOSE_RETRY_SEC, type MonitorState, type StateSt
 import { MIN_SETTLE_AGE_MS } from './pending-orders.js';
 import type { FollowedTrader } from './following.js';
 import type { CopyEntry } from './copy-ledger.js';
-import { copyEntry } from './test-fakes.js';
+import { copyEntry, notionalFor } from './test-fakes.js';
 
 // --- Fakes: nothing here touches the network or disk ---
 
@@ -72,6 +72,31 @@ function dexTrade(owner: string, trade: string, updates: { updateType: string; u
     })),
   };
 }
+
+/**
+ * The feed post Invo makes for a change to `owner`'s trade `trade` (update.id = the
+ * change's investmentId), carrying its $ figures like live ones (see notionalFor).
+ */
+function changePost(owner: string, trade: string, investmentId: string, kind: 'increase' | 'decrease', ratio: number, extra: { post?: object } = {}) {
+  const n = notionalFor(kind, ratio, investmentId);
+  return post(owner, trade, 'update', {
+    post: extra.post,
+    update: {
+      id: investmentId,
+      entrySim: n.entrySimAfter,
+      entryPrice: n.entryPriceAfter,
+      changes: {
+        entrySim: n.entrySimBefore, simDifference: n.simDifference, simIncrease: n.simIncrease,
+        ...(n.entryPriceBefore !== null && { entryPrice: n.entryPriceBefore }), livePriceAtChange: n.livePriceAtChange,
+      },
+    },
+  });
+}
+/** stdout change_not_replicated alerts. */
+const alerts = (events: Awaited<ReturnType<SignalWatcher['poll']>>) =>
+  events.filter(e => e.data.type === 'change_not_replicated').map(e => ({ ...(e.data as any), endsWait: e.signal === true, stream: e.stream }));
+const changeSignals = (events: Awaited<ReturnType<SignalWatcher['poll']>>) =>
+  events.filter(e => e.data.type === 'signal' && ['increase', 'decrease', 'tpsl'].includes((e.data as any).action)).map(e => e.data as any);
 
 /** Feed newest-first; `lastPostId` pages to older posts (or is ignored, like a broken cursor). */
 function fakeInvo(opts: { ignoreCursor?: boolean } = {}) {
@@ -445,9 +470,13 @@ test('/dex/trade increases and decreases of a copied trade become signals, in th
     { updateType: 'decrease', investmentId: 'v3', updatedAt: '2026-10-02T17:59:00.000Z', details: { positionSizeBefore: 0.1, positionSizeAfter: 0.075, positionSizeChange: 0.025 } },
     { updateType: 'increase', investmentId: 'v2', updatedAt: '2026-10-02T17:58:00.000Z', details: { positionSizeBefore: 0.05, positionSizeAfter: 0.1, positionSizeChange: 0.05 } },
   ]));
-  const s = signals(await w.poll());
+  invo.publish(changePost('alice', 't1', 'v2', 'increase', 1.3), changePost('alice', 't1', 'v3', 'decrease', 0.2));
+  const s = changeSignals(await w.poll());
   assert.deepEqual(s.map(x => [x.action, x.investmentId, x.change.positionSizeBefore, x.change.positionSizeAfter]),
     [['increase', 'v2', 0.05, 0.1], ['decrease', 'v3', 0.1, 0.075]]);
+  // Each carries the $ figures of its own feed post
+  assert.deepEqual(s.map(x => [x.change.notional.investmentId, x.change.notional.simIncrease, x.change.notional.simDifference]),
+    [['v2', true, 130], ['v3', false, 20]]);
 });
 
 test('an increase older than the signal age limit, or a change made before our copy opened, is skipped', async () => {
@@ -461,11 +490,14 @@ test('an increase older than the signal age limit, or a change made before our c
     { updateType: 'increase', investmentId: 'v2', updatedAt: '2026-10-02T17:50:00.000Z', details: { positionSizeBefore: 0.1, positionSizeAfter: 0.2, positionSizeChange: 0.1 } },
     { updateType: 'decrease', investmentId: 'v3', updatedAt: '2026-10-02T12:00:00.000Z', details: { positionSizeBefore: 0.2, positionSizeAfter: 0.1, positionSizeChange: 0.1 } },
   ]));
+  invo.publish(changePost('alice', 't1', 'v1', 'increase', 1), changePost('alice', 't1', 'v2', 'increase', 1), changePost('alice', 't1', 'v3', 'decrease', 0.5));
   const events = await w.poll();
   // The TP set before our copy opened still applies (it's the trader's current TP); a stale decrease still applies too
-  assert.deepEqual(signals(events).map(x => [x.action, x.investmentId]), [['tpsl', 'v1'], ['decrease', 'v3']]);
+  assert.deepEqual(changeSignals(events).map(x => [x.action, x.investmentId]), [['tpsl', 'v1'], ['decrease', 'v3']]);
+  // Before our copy opened: nothing to replicate, a quiet skip. Too old to copy: the copy diverges, an alert
   assert.deepEqual(skipped(events).map(x => [x.updateType, x.reason.split(' — ')[0]]),
-    [['increase', 'increase made before our copy opened (our size is set from our equity at open)'], ['increase', 'increase made 600s ago']]);
+    [['increase', 'increase made before our copy opened (our size is set from our equity at open)']]);
+  assert.deepEqual(alerts(events).map(x => [x.action, x.change.investmentId, x.reason.split(' — ')[0]]), [['add', 'v2', 'increase made 600s ago']]);
 });
 
 test('changes to a trade its trader already closed are skipped; the close wins', async () => {
@@ -481,14 +513,16 @@ test('changes to a trade its trader already closed are skipped; the close wins',
   assert.match(skipped(events)[0].reason, /already closed/);
 });
 
-test('an unknown /dex/trade change on a copied trade is reported as skipped, never guessed at', async () => {
+test('an unknown /dex/trade change on a copied trade is alerted, never guessed at', async () => {
   const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
   const w = make();
   await w.poll();
   invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'leverage', details: { leverage: 10 } }]));
   const events = await w.poll();
   assert.deepEqual(signals(events), []);
-  assert.match(skipped(events)[0].reason, /unknown \/dex\/trade updateType "leverage" — not replicated/);
+  const [a] = alerts(events);
+  assert.equal(a.action, 'change (leverage)');
+  assert.match(a.reason, /unknown \/dex\/trade updateType "leverage" — not replicated/);
 });
 
 test('a copy is watched on /dex/trade from when its trader opened, so earlier TP/SL changes are seen', async () => {
@@ -591,4 +625,212 @@ test('ambiguous trade changes are emitted as update, never as an open', async ()
   await w.poll();
   invo.publish(post('alice', 't1', 'update'), post('alice', 't2', 'open', { update: { changes: undefined } }));
   assert.deepEqual(signals(await w.poll()).map(x => x.action), ['update', 'update']);
+});
+
+// --- Increases/decreases are held for the feed post with their $ figures ---
+
+const incUpdate = (investmentId: string, updatedAt = '2026-10-02T17:58:00.000Z') =>
+  ({ updateType: 'increase', investmentId, updatedAt, details: { positionSizeBefore: 0.05, positionSizeAfter: 0.1, positionSizeChange: 0.05 } });
+
+test('an increase waits for its feed post, then is sent with that post\'s $ figures', async () => {
+  const { invo, make, advance } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w = make();
+  await w.poll();
+  invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  const first = await w.poll();
+  assert.deepEqual(changeSignals(first), [], 'held: no post yet');
+  assert.deepEqual(skipped(first), []);
+
+  advance(6_000); // the post comes ~6s later (as seen live)
+  invo.publish(changePost('alice', 't1', 'v2', 'increase', 0.4));
+  const [s] = changeSignals(await w.poll());
+  assert.deepEqual([s.action, s.investmentId, s.change.notional.investmentId, s.change.notional.simIncrease], ['increase', 'v2', 'v2', true]);
+  assert.equal(changeSignals(await w.poll()).length, 0, 'sent once');
+});
+
+test('a feed post seen before its /dex/trade change is used when the change arrives', async () => {
+  const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w = make();
+  await w.poll();
+  invo.publish(changePost('alice', 't1', 'v2', 'increase', 0.4));
+  await w.poll();
+  invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  assert.deepEqual(changeSignals(await w.poll()).map(x => x.investmentId), ['v2']);
+});
+
+test('with no feed post within 120s the change is alerted as not replicated, never sized from positionSize', async () => {
+  const { invo, make, advance } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w = make();
+  await w.poll();
+  invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  await w.poll();
+  advance(119_000);
+  const waiting = await w.poll();
+  assert.deepEqual([skipped(waiting), alerts(waiting)], [[], []], 'still waiting at 119s');
+  advance(2_000);
+  const events = await w.poll();
+  assert.deepEqual(changeSignals(events), []);
+  assert.match(alerts(events)[0].reason, /no feed post with its \$ figures within 120s — .* not replicated/);
+  // A post arriving after that doesn't revive it
+  invo.publish(changePost('alice', 't1', 'v2', 'increase', 0.4));
+  assert.deepEqual(changeSignals(await w.poll()), []);
+});
+
+test('a feed post for another trader, a repost, or the wrong kind of change is not used', async () => {
+  const cases: [string, any, RegExp | null][] = [
+    ['another trader\'s post with the same id', changePost('bob', 't1', 'v2', 'increase', 0.4), /another trader, trade or kind/],
+    ['wrong kind', changePost('alice', 't1', 'v2', 'decrease', 0.4), /another trader, trade or kind/],
+    ['repost', changePost('alice', 't1', 'v2', 'increase', 0.4, { post: { repostId: 'orig' } }), null],
+  ];
+  for (const [name, p, err] of cases) {
+    const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+    const w = make();
+    await w.poll();
+    invo.publish(p);
+    invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+    const events = await w.poll();
+    assert.deepEqual(changeSignals(events), [], name);
+    if (err) assert.match(alerts(events)[0].reason, err, name);
+    else assert.deepEqual([alerts(events), skipped(events).filter(x => x.updateType === 'increase')], [[], []], `${name}: ignored, still waiting`);
+  }
+});
+
+test('a change waiting for its post survives a monitor restart', async () => {
+  const { invo, make, advance } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  await make().poll();
+  invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  await make().poll(); // seen, waiting — then this process exits
+  advance(10_000);
+  invo.publish(changePost('alice', 't1', 'v2', 'increase', 0.4));
+  const s = changeSignals(await make().poll()); // a new process: the update is already "seen" on /dex/trade
+  assert.deepEqual(s.map(x => x.investmentId), ['v2']);
+});
+
+test('TP/SL changes are not held (they carry their own price)', async () => {
+  const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w = make();
+  await w.poll();
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'tp', investmentId: 'v2', details: { priceTarget: 150 } }]));
+  assert.deepEqual(changeSignals(await w.poll()).map(x => x.action), ['tpsl']);
+});
+
+// --- change_not_replicated: a skipped add / partial close is reported on stdout ---
+
+const decUpdate = (investmentId: string, updatedAt = '2026-10-02T17:59:00.000Z') =>
+  ({ updateType: 'decrease', investmentId, updatedAt, details: { positionSizeBefore: 0.1, positionSizeAfter: 0.06, positionSizeChange: 0.04 } });
+
+/** Poll until the 120s wait for a feed post runs out; returns that poll's events. */
+async function pollPastWait(w: SignalWatcher, advance: (ms: number) => void) {
+  await w.poll();
+  advance(121_000);
+  return w.poll();
+}
+
+test('alert: a skipped add says who, which trade, coin, action, why, our copy, and that no order was sent', async () => {
+  const { invo, make, advance } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w = make();
+  await w.poll();
+  invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  const events = await pollPastWait(w, advance);
+  const [a] = alerts(events);
+  assert.deepEqual(
+    {
+      type: a.type, action: a.action, orderSent: a.orderSent, coin: a.coin, side: a.side, stream: a.stream, endsWait: a.endsWait,
+      trader: a.trader, copy: a.copy, change: a.change,
+    },
+    {
+      type: 'change_not_replicated', action: 'add', orderSent: false, coin: 'SOL', side: 'long', stream: 'out', endsWait: true,
+      trader: { id: 'alice', username: 'alice', portfolioId: 'p-alice', tradeBaseId: 'base-t1', tradeBaseShortId: 'short-t1' },
+      copy: { entryId: 'tx-a', qty: 0.5, status: 'open' },
+      change: { updateType: 'increase', updatedAt: '2026-10-02T17:58:00.000Z', investmentId: 'v2', traderPositionShareBefore: 0.05, traderPositionShareAfter: 0.1 },
+    });
+  assert.match(a.reason, /no feed post with its \$ figures within 120s/);
+  assert.match(a.message, /^NOT REPLICATED — @alice's add on SOL \(trade short-t1\): increase: no feed post .*\. No order was sent; our copy stays 0\.5 SOL long/);
+  assert.deepEqual(changeSignals(events), [], 'no signal to act on');
+  // Reported once
+  assert.deepEqual(alerts(await w.poll()), []);
+});
+
+test('alert: a skipped partial close is reported as such', async () => {
+  const { invo, make, advance } = setup({ ledger: [copyEntry('tx-a', 'SOL', 2, 'alice', 't1')] });
+  const w = make();
+  await w.poll();
+  invo.trades.push(dexTrade('alice', 't1', [decUpdate('v3')]));
+  const [a] = alerts(await pollPastWait(w, advance));
+  assert.deepEqual([a.action, a.orderSent, a.copy.qty, a.change.traderPositionShareBefore, a.change.traderPositionShareAfter], ['partial close', false, 2, 0.1, 0.06]);
+  assert.match(a.message, /@alice's partial close on SOL .* No order was sent; our copy stays 2 SOL long, which may no longer match the trader's position/);
+});
+
+test('alert: a post that doesn\'t match the change, and a stale add, are alerted with their reason', async () => {
+  const mismatch = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w1 = mismatch.make();
+  await w1.poll();
+  mismatch.invo.publish(changePost('alice', 't1', 'v2', 'decrease', 0.3)); // a decrease post for an increase
+  mismatch.invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  const [a1] = alerts(await w1.poll());
+  assert.deepEqual([a1.action, a1.orderSent], ['add', false]);
+  assert.match(a1.reason, /feed post for it \(post-\d+\) is for another trader, trade or kind of change/);
+
+  const stale = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w2 = stale.make();
+  await w2.poll();
+  clock = Date.parse('2026-10-02T18:00:00.000Z');
+  stale.invo.publish(changePost('alice', 't1', 'v2', 'increase', 0.5));
+  stale.invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2', '2026-10-02T17:50:00.000Z')]));
+  const [a2] = alerts(await w2.poll());
+  assert.match(a2.reason, /increase made 600s ago — too old to copy/);
+});
+
+test('alert: for a trader no longer followed the username is unknown and the id is named instead', async () => {
+  const { invo, make, advance } = setup({ following: ['bob'], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w = make();
+  await w.poll();
+  invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  const [a] = alerts(await pollPastWait(w, advance));
+  assert.deepEqual([a.trader.id, a.trader.username], ['alice', null]);
+  assert.match(a.message, /^NOT REPLICATED — trader alice's add on SOL/);
+});
+
+test('no alert where there is nothing to replicate: copy gone, trade closed, change made before our copy', async () => {
+  // The copy closes while its change waits for a post
+  const ledger = [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')];
+  const gone = setup({ ledger });
+  const w = gone.make();
+  await w.poll();
+  gone.invo.trades.push(dexTrade('alice', 't1', [incUpdate('v2')]));
+  await w.poll();
+  ledger[0] = { ...ledger[0], status: 'closed', qty: 0 };
+  gone.advance(121_000);
+  const events = await w.poll();
+  assert.deepEqual(alerts(events), []);
+  assert.match(skipped(events)[0].reason, /copy that is no longer open — nothing to replicate/);
+
+  // Trade already closed: the close wins
+  const closed = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w2 = closed.make();
+  await w2.poll();
+  closed.invo.publish(changePost('alice', 't1', 'v2', 'increase', 0.5));
+  closed.invo.trades.push(dexTrade('alice', 't1', [
+    { updateType: 'close', investmentId: 'v3', updatedAt: '2026-10-02T17:59:00.000Z', details: { closePrice: 140, reasonClosed: 'user_closed' } },
+    incUpdate('v2'),
+  ]));
+  assert.deepEqual(alerts(await w2.poll()), []);
+
+  // Made before our copy opened (copy opened 2026-10-01)
+  const early = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  const w3 = early.make();
+  await w3.poll();
+  early.invo.publish(changePost('alice', 't1', 'v1', 'increase', 0.5));
+  early.invo.trades.push(dexTrade('alice', 't1', [incUpdate('v1', '2026-09-30T12:00:00.000Z')]));
+  assert.deepEqual(alerts(await w3.poll()), []);
+});
+
+test('alert: a change waiting when the monitor restarts is still alerted by the new process', async () => {
+  const { invo, make, advance } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  await make().poll();
+  invo.trades.push(dexTrade('alice', 't1', [decUpdate('v3')]));
+  await make().poll(); // seen, waiting — process exits
+  advance(121_000);
+  const [a] = alerts(await make().poll());
+  assert.deepEqual([a.action, a.change.investmentId, a.orderSent], ['partial close', 'v3', false]);
 });

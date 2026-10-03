@@ -15,6 +15,8 @@ import {
   tierTargetUsd,
   SLIPPAGE_PCT,
   MAX_EQUITY_PCT,
+  MAX_COMBINED_EQUITY_PCT,
+  MIN_ORDER_NOTIONAL_USD,
 } from './sizing.js';
 import { getTraderStats, type TraderStatsClient } from './trader-stats.js';
 import { MANUAL_TRADE_ARG, type MimicMeta } from './mimic-meta.js';
@@ -141,6 +143,24 @@ export function checkExistingLeverage(coin: string, position: HlPosition, levera
       `whole position (other copies included) — the trader's ${leverage}x can't be replicated while it is held`,
     );
   }
+}
+
+/**
+ * USD notional of every active copy in the ledger (open entries' qty, plus the requested
+ * size of any open order not yet settled), valued at current mids. Throws if a coin with
+ * a copy has no mid: exposure that can't be valued can't be capped.
+ */
+export function activeCopiesNotionalUsd(entries: CopyEntry[], mids: Record<string, string>): number {
+  let total = 0;
+  for (const e of entries) {
+    if (e.status !== 'open' && e.status !== 'pending') continue;
+    const qty = e.qty + (e.pendingOrder?.kind === 'open' ? e.pendingOrder.requestedQty : 0);
+    if (!(qty > 0)) continue;
+    const px = parseFloat(mids[e.coin]);
+    if (!(px > 0)) throw new Error(`No mid price for ${e.coin} (ledger entry ${e.id}) — can't value active copies for the combined cap`);
+    total += qty * px;
+  }
+  return total;
 }
 
 function refuseRepeat(entry: CopyEntry, updateId: string): never {
@@ -310,6 +330,17 @@ async function execute(req: Request, deps: TradeDeps) {
     if (copy.sl != null) assertTriggerSide('sl', copy.sl, mid0, isBuy);
   }
 
+  // An open the combined cap can't take is refused before leverage is set (re-checked below
+  // with the equity and prices the order is sized from)
+  if (req.mode === 'open') {
+    const early = copyRange(await hl.getAccountEquity());
+    const room = (early.equityUsd * MAX_COMBINED_EQUITY_PCT) / 100 - activeCopiesNotionalUsd(ledgerEntries, await hl.getAllMids());
+    if (room < early.minUsd) {
+      throw new Error(`Combined cap: $${Math.max(0, room).toFixed(2)} left under ${MAX_COMBINED_EQUITY_PCT}% of $${early.equityUsd.toFixed(2)} equity ` +
+        `for all active copies, less than the $${early.minUsd.toFixed(2)} a new copy needs at minimum — refusing rather than opening below the 5% floor`);
+    }
+  }
+
   // Trader's tier, as a % of equity. Stats null on any lookup failure → poor tier (5%)
   const statsLookup = await getTraderStats(invo, mimicMetaArg ?? target?.source ?? null);
   const perf = classifyTrader(statsLookup.stats);
@@ -323,8 +354,25 @@ async function execute(req: Request, deps: TradeDeps) {
   // (up to 20s each), and the size must track the balance and price as they are when the
   // order goes out. Only a local ledger write sits between these reads and the order.
   const range = copyRange(await hl.getAccountEquity()); // throws if unusable or too small
-  const mid = parseFloat((await hl.getAllMids())[coin]);
+  const mids = await hl.getAllMids();
+  const mid = parseFloat(mids[coin]);
   if (!mid) throw new Error(`No mid price for ${coin}`);
+
+  // Combined cap: every active copy on the account plus this order stays within
+  // MAX_COMBINED_EQUITY_PCT of equity (worst-case fill for this order, mid for the rest)
+  const combinedCapUsd = (range.equityUsd * MAX_COMBINED_EQUITY_PCT) / 100;
+  const combinedExposureUsd = activeCopiesNotionalUsd(ledgerEntries, mids);
+  const combinedHeadroomUsd = combinedCapUsd - combinedExposureUsd;
+  const combinedRefusal = (need: number, what: string) =>
+    `Combined cap: active copies are $${combinedExposureUsd.toFixed(2)} of the $${combinedCapUsd.toFixed(2)} allowed ` +
+    `(${MAX_COMBINED_EQUITY_PCT}% of $${range.equityUsd.toFixed(2)} equity) — $${Math.max(0, combinedHeadroomUsd).toFixed(2)} left, ` +
+    `less than the $${need.toFixed(2)} ${what}`;
+  if (req.mode === 'open' && combinedHeadroomUsd < range.minUsd) {
+    throw new Error(`${combinedRefusal(range.minUsd, 'a new copy needs at minimum')} — refusing rather than opening below the 5% floor`);
+  }
+  if (req.mode === 'increase' && combinedHeadroomUsd < MIN_ORDER_NOTIONAL_USD) {
+    throw new Error(`Can't copy the increase: ${combinedRefusal(MIN_ORDER_NOTIONAL_USD, 'minimum order')}`);
+  }
 
   // A copy enters no worse than the trader's own entry allows (see entryBoundPx), and its
   // TP/SL must still be on the right side of the price, or nothing is opened
@@ -339,8 +387,11 @@ async function execute(req: Request, deps: TradeDeps) {
   //               - the tier's % of equity (≤ 15%) for this add
   //               - what keeps the whole copy within 15% of equity (MAX_EQUITY_PCT)
   //               - 80% of the current notional (the smaller of this copy and the whole coin position)
+  //   both:     never more than the room left under the combined cap (above); an open is
+  //             still at least 5% of equity, or it was refused
   // Bounds hold at the worst-case fill (orderPx ± SLIPPAGE_PCT), not just at mid.
-  const tierUsd = Math.min(tierTargetUsd(range.equityUsd, perf.equityPct), range.maxUsd);
+  const openRange = { minUsd: range.minUsd, maxUsd: Math.min(range.maxUsd, combinedHeadroomUsd) };
+  const tierUsd = Math.min(tierTargetUsd(range.equityUsd, perf.equityPct), openRange.maxUsd);
   const copyNotionalUsd = target ? target.qty * mid : 0;
   const positionNotionalUsd = Math.abs(existingSzi) * mid;
   const mirroredUsd = req.mode === 'increase' ? copyNotionalUsd * req.sig.ratio : null;
@@ -352,10 +403,10 @@ async function execute(req: Request, deps: TradeDeps) {
       `${MAX_EQUITY_PCT}% of equity ($${range.maxUsd.toFixed(2)}) — the maximum a copy may reach`,
     );
   }
-  const targetUsd = mirroredUsd === null ? tierUsd : Math.min(mirroredUsd, tierUsd, copyHeadroomUsd!);
+  const targetUsd = mirroredUsd === null ? tierUsd : Math.min(mirroredUsd, tierUsd, copyHeadroomUsd!, combinedHeadroomUsd);
   const sizing = req.mode === 'increase'
     ? sizeIncrease(targetUsd, Math.min(copyNotionalUsd, positionNotionalUsd), mid, szDecimals, isBuy, SLIPPAGE_PCT)
-    : sizeInitial(targetUsd, range, orderPx, szDecimals, isBuy, SLIPPAGE_PCT);
+    : sizeInitial(targetUsd, openRange, orderPx, szDecimals, isBuy, SLIPPAGE_PCT);
   const sizeStr = sizing.qty;
 
   const clientTxId = newId();
@@ -405,7 +456,8 @@ async function execute(req: Request, deps: TradeDeps) {
     size: sizeStr,
     leverage,
     ...(copy && { trader: { entryPrice: copy.entryPrice, tp: copy.tp, sl: copy.sl } }),
-    ...(req.mode === 'increase' && { trader: { ratio: req.sig.ratio, updateId: req.sig.updateId } }),
+    // ratio: the trader's add in coins, from their $ figures; positionSizeRatio: /dex/trade's (reference only)
+    ...(req.mode === 'increase' && { trader: { ratio: req.sig.ratio, positionSizeRatio: req.sig.positionSizeRatio, updateId: req.sig.updateId } }),
     sizing: {
       mode: req.mode === 'increase' ? 'increase' : 'initial',
       tier: perf.tier,
@@ -417,6 +469,9 @@ async function execute(req: Request, deps: TradeDeps) {
       targetUsd: round2(targetUsd),
       ...(mirroredUsd !== null && { mirroredUsd: round2(mirroredUsd) }),
       ...(copyHeadroomUsd !== null && { copyHeadroomUsd: round2(copyHeadroomUsd), positionNotionalUsd: round2(positionNotionalUsd) }),
+      combinedCapUsd: round2(combinedCapUsd),
+      combinedExposureUsd: round2(combinedExposureUsd),
+      combinedHeadroomUsd: round2(combinedHeadroomUsd),
       notionalUsd: sizing.notionalUsd,
       minFillNotionalUsd: sizing.minFillNotionalUsd,
       maxFillNotionalUsd: sizing.maxFillNotionalUsd,

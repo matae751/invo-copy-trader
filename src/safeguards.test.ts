@@ -9,7 +9,7 @@ import { runTrade } from './trade-exec.js';
 import { runClose } from './close-exec.js';
 import { runTpsl, isTriggerLike, type OpenOrder } from './tpsl-exec.js';
 import { SignalWatcher, type MonitorState } from './signal-watcher.js';
-import { MemoryLedgerStore, fakeHl, fakeInvo, signalMeta, copyEntry } from './test-fakes.js';
+import { MemoryLedgerStore, fakeHl, fakeInvo, signalMeta, copyEntry, notionalFor } from './test-fakes.js';
 import type { CopyEntry } from './copy-ledger.js';
 
 const NOW_MS = Date.parse('2026-10-02T12:00:00.000Z');
@@ -46,12 +46,14 @@ function openSig(opts: { postedAtSec?: number | null; trade?: Record<string, unk
 }
 const increaseSig = (ratio: number, atSec = -30, trader = 'alice', tradeId = 't1') => JSON.stringify({
   type: 'signal', source: 'trade_poll', action: 'increase', updateId: `${tradeId}_inc_${atSec}`, investmentId: `inv${atSec}`, updatedAt: iso(atSec),
-  trade: { coin: 'SOL', side: 'long' }, change: { positionSizeBefore: 0.1, positionSizeAfter: 0.1 * (1 + ratio), positionSizeChange: 0.1 * ratio },
+  trade: { coin: 'SOL', side: 'long' },
+  change: { positionSizeBefore: 0.1, positionSizeAfter: 0.1 * (1 + ratio), positionSizeChange: 0.1 * ratio, notional: notionalFor('increase', ratio, `inv${atSec}`) },
   mimicMeta: ident(trader, tradeId),
 });
 const decreaseSig = (before: number, after: number, atSec = -10, trader = 'alice', tradeId = 't1') => JSON.stringify({
   type: 'signal', source: 'trade_poll', action: 'decrease', updateId: `${tradeId}_dec_${atSec}`, investmentId: `inv${atSec}`, updatedAt: iso(atSec),
-  trade: { coin: 'SOL', side: 'long' }, change: { positionSizeBefore: before, positionSizeAfter: after, positionSizeChange: before - after },
+  trade: { coin: 'SOL', side: 'long' },
+  change: { positionSizeBefore: before, positionSizeAfter: after, positionSizeChange: before - after, notional: notionalFor('decrease', (before - after) / before, `inv${atSec}`) },
   mimicMeta: ident(trader, tradeId),
 });
 const tpslSig = (which: 'tp' | 'sl', triggerPx: number, atSec = -10) => JSON.stringify({

@@ -38,6 +38,14 @@ export const TIER_EQUITY_PCT = {
   strong: 15,
 } as const;
 export const MAX_INCREASE_FRACTION = 0.8;
+/**
+ * Combined cap: the notional of every active copy on the account (all coins, all
+ * traders, manual trades included, pending orders counted at their requested size)
+ * plus a new order at its worst-case fill may not exceed this % of current equity.
+ * Opens and adds both respect it, so several traders sending the same signal can't
+ * stack past it.
+ */
+export const MAX_COMBINED_EQUITY_PCT = 80;
 export const MIN_ORDER_NOTIONAL_USD = 10; // Hyperliquid minimum order value
 export const SLIPPAGE_PCT = 0.02;
 
