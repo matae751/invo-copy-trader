@@ -99,14 +99,20 @@ const alerts = (events: Awaited<ReturnType<SignalWatcher['poll']>>) =>
 const changeSignals = (events: Awaited<ReturnType<SignalWatcher['poll']>>) =>
   events.filter(e => e.data.type === 'signal' && ['increase', 'decrease', 'tpsl'].includes((e.data as any).action)).map(e => e.data as any);
 
+// Live /investment/status shapes (captured 2026-10-03)
+const STATUS_OPEN = { status: { isOpen: true, exists: true }, success: true };
+const STATUS_CLOSED = { status: { isOpen: false, exists: true }, success: true };
+
 /** Feed newest-first; `lastPostId` pages to older posts (or is ignored, like a broken cursor). */
 function fakeInvo(opts: { ignoreCursor?: boolean } = {}) {
   const feed: any[] = [];
   /** /dex/trade `data` entries (see dexTrade); `rawTradeResponse` replaces the whole response. */
   const trades: any[] = [];
-  const calls = { getFeed: [] as (string | null)[], getTradeUpdates: [] as WatchEntry[][] };
+  /** /investment/status responses by baseId (a function may throw); none → an error, like an unknown id. */
+  const statuses = new Map<string, unknown>();
+  const calls = { getFeed: [] as (string | null)[], getTradeUpdates: [] as WatchEntry[][], getInvestmentStatus: [] as string[] };
   return {
-    feed, trades, calls,
+    feed, trades, calls, statuses,
     rawTradeResponse: undefined as unknown,
     publish(...posts: any[]) { feed.unshift(...posts.reverse()); },
     async getFeed(_filter: string, lastPostId: string | null, itemLimit: number) {
@@ -117,6 +123,12 @@ function fakeInvo(opts: { ignoreCursor?: boolean } = {}) {
     async getTradeUpdates(investments: WatchEntry[]) {
       calls.getTradeUpdates.push(investments);
       return this.rawTradeResponse ?? { success: true, data: trades };
+    },
+    async getInvestmentStatus(baseId: string) {
+      calls.getInvestmentStatus.push(baseId);
+      const r = statuses.get(baseId);
+      if (typeof r === 'function') return r();
+      return r ?? { status: 'error', statusCode: 500, message: 'Base ID must be a valid UUID' };
     },
   };
 }
@@ -536,6 +548,7 @@ test('changes to a trade its trader already closed are skipped; the close wins',
 
 test('an unknown /dex/trade change on a copied trade is alerted, never guessed at', async () => {
   const { invo, make } = setup({ ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.statuses.set('base-t1', STATUS_OPEN);
   const w = make();
   await w.poll();
   invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'leverage', details: { leverage: 10 } }]));
@@ -543,7 +556,7 @@ test('an unknown /dex/trade change on a copied trade is alerted, never guessed a
   assert.deepEqual(signals(events), []);
   const [a] = alerts(events);
   assert.equal(a.action, 'change (leverage)');
-  assert.match(a.reason, /unknown \/dex\/trade updateType "leverage" — not replicated/);
+  assert.match(a.reason, /unknown \/dex\/trade updateType "leverage" — Invo reports the trade still open.*not replicated/);
 });
 
 test('a copy is watched on /dex/trade from when its trader opened, so earlier TP/SL changes are seen', async () => {
@@ -611,10 +624,105 @@ test('a /dex/trade close for another trader\'s trade with the same short id is n
   assert.deepEqual(signals(await make().poll()), []);
 });
 
-test('a liquidation update also counts as the trade being over', async () => {
+test('a liquidation arrives as a close with reasonClosed "liquidated" (the live shape) and closes the copy', async () => {
   const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
-  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidated' }]));
-  assert.deepEqual(signals(await make().poll()).map(x => x.action), ['close']);
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'close', details: { closePrice: 140, reasonClosed: 'liquidated' } }]));
+  const s = signals(await make().poll());
+  assert.deepEqual(s.map(x => [x.action, x.reasonClosed, x.copied, x.mimicMeta.sourcePaperTradeBaseId]), [['close', 'liquidated', true, 'base-t1']]);
+});
+
+const unconfirmedEvents = (events: Awaited<ReturnType<SignalWatcher['poll']>>) =>
+  events.filter(e => e.data.type === 'unknown_update_closed').map(e => ({ ...(e.data as any), endsWait: e.signal === true, stream: e.stream }));
+
+test('an update type never seen live (e.g. "liquidated") is not guessed from its name: a trade Invo reports open is alerted, not closed', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.statuses.set('base-t1', STATUS_OPEN);
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidated', investmentId: 'inv-liq' }]));
+  const events = await make().poll();
+  assert.deepEqual(invo.calls.getInvestmentStatus, ['base-t1']);
+  assert.deepEqual(signals(events), []);
+  assert.deepEqual(alerts(events).map(a => [a.change.updateType, a.orderSent, a.endsWait]), [['liquidated', false, true]]);
+  assert.match(alerts(events)[0].reason, /reports the trade still open/);
+});
+
+test('an unknown update type on a trade Invo reports closed closes the copy like any other close, with a notice', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.statuses.set('base-t1', STATUS_CLOSED);
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidation', investmentId: 'inv-liq', details: { closePrice: 140, reasonClosed: 'liquidated' } }]));
+  const events = await make().poll();
+  const s = signals(events);
+  assert.deepEqual(s.map(x => [x.action, x.reasonClosed, x.trade.closingPrice, x.copied, x.mimicMeta.sourcePaperTradeBaseId]),
+    [['close', 'liquidated', 140, true, 'base-t1']]);
+  assert.equal(parseTradeSignal(JSON.stringify(s[0])).kind, 'close');
+  assert.deepEqual(unconfirmedEvents(events).map(e => [e.change.updateType, e.stream, e.endsWait]), [['liquidation', 'out', false]]);
+  assert.deepEqual(alerts(events), []);
+});
+
+test('an unknown update type with no reason given closes with reasonClosed null, never a guessed one', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.statuses.set('base-t1', STATUS_CLOSED);
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidated', investmentId: 'inv-liq' }]));
+  assert.deepEqual(signals(await make().poll()).map(x => [x.action, x.reasonClosed]), [['close', null]]);
+});
+
+test('an unknown update type whose trade status can\'t be read is alerted once and re-checked; a later closed status closes the copy', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.statuses.set('base-t1', () => { throw new Error('ETIMEDOUT'); });
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidated', investmentId: 'inv-liq' }]));
+  const first = await make().poll();
+  assert.deepEqual(signals(first), []);
+  assert.deepEqual(alerts(first).map(a => [a.orderSent, a.endsWait]), [[false, true]]);
+  assert.match(alerts(first)[0].reason, /status couldn't be read \(ETIMEDOUT\).*re-checking/);
+
+  // Still unreadable (junk response): no second alert
+  invo.statuses.set('base-t1', { success: true, data: [] });
+  const second = await make().poll(); // a new process: carried in saved state
+  assert.deepEqual([signals(second), alerts(second)], [[], []]);
+
+  invo.statuses.set('base-t1', STATUS_CLOSED);
+  const third = await make().poll();
+  assert.deepEqual(signals(third).map(x => x.action), ['close']);
+  assert.equal(unconfirmedEvents(third).length, 1);
+  assert.deepEqual(invo.calls.getInvestmentStatus, ['base-t1', 'base-t1', 'base-t1']);
+  await make().poll();
+  assert.equal(invo.calls.getInvestmentStatus.length, 3, 'resolved: not checked again');
+});
+
+test('an unknown update type whose status stays unreadable is given up on after maxStatusChecks, never closed', async () => {
+  const ledger = [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')];
+  const { invo, state } = setup({ following: [], ledger });
+  const w = new SignalWatcher({
+    invo, registry: fakeRegistry([]), ledger: { load: () => ledger }, state, now: () => clock, maxStatusChecks: 3,
+  });
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidated', investmentId: 'inv-liq' }]));
+  const polls = [];
+  for (let i = 0; i < 5; i++) polls.push(await w.poll());
+  assert.equal(invo.calls.getInvestmentStatus.length, 3);
+  assert.deepEqual(polls.flatMap(signals), []);
+  assert.equal(polls.flatMap(alerts).length, 1);
+  assert.deepEqual(polls.flatMap(e => e.filter(x => x.data.type === 'error' && x.data.source === 'trade_status')).length, 1);
+});
+
+test('a status saying the trade does not exist is unreadable, not closed', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.statuses.set('base-t1', { status: { isOpen: false, exists: false }, success: true });
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'liquidated', investmentId: 'inv-liq' }]));
+  const events = await make().poll();
+  assert.deepEqual(signals(events), []);
+  assert.match(alerts(events)[0].reason, /status couldn't be read/);
+});
+
+test('an unknown update type on a trade already closed is skipped quietly: no alert, no status lookup', async () => {
+  const { invo, make } = setup({ following: [], ledger: [copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1')] });
+  invo.trades.push(dexTrade('alice', 't1', [
+    { updateType: 'close', investmentId: 'inv-c', details: { closePrice: 140, reasonClosed: 'liquidated' } },
+    { updateType: 'liquidated', investmentId: 'inv-liq' },
+  ]));
+  const events = await make().poll();
+  assert.deepEqual(signals(events).map(x => x.action), ['close']);
+  assert.deepEqual(alerts(events), []);
+  assert.deepEqual(invo.calls.getInvestmentStatus, []);
+  assert.ok(skipped(events).some(x => /already closed/.test(x.reason)));
 });
 
 test('an unrecognised /dex/trade response is reported, not read as "no updates" silently', async () => {
@@ -854,4 +962,133 @@ test('alert: a change waiting when the monitor restarts is still alerted by the 
   advance(121_000);
   const [a] = alerts(await make().poll());
   assert.deepEqual([a.action, a.change.investmentId, a.orderSent], ['partial close', 'v3', false]);
+});
+
+// --- Every signal type in its live shape (captured 2026-10-02/03, 146 feed posts, 276 /dex/trade updates) ---
+// Feed: update.* is the trade's current state; changes holds the previous values of what this post changed.
+
+const LIVE_OPEN = { isOpen: true, changes: { isAdded: false }, directionLong: true, leverage: 20, entryPrice: 86740, priceTarget: 87607, stopLoss: null, reasonClosed: null, isLiquidated: false };
+const livePosts = (createdAt: string) => ({
+  open: post('alice', 'open1', 'open', { update: { ...LIVE_OPEN, createdAt } }),
+  // An open post read after its trade closed: now isOpen false — a close, never an open
+  openNowClosed: post('alice', 'open2', 'open', { update: { ...LIVE_OPEN, isOpen: false, reasonClosed: 'user_closed', closingPrice: 86424, createdAt } }),
+  close: post('alice', 'cl1', 'close', { update: { ...LIVE_OPEN, isOpen: false, changes: { isOpen: true, reasonClosed: null }, reasonClosed: 'user_closed', closingPrice: 2730.7, createdAt } }),
+  liquidated: post('alice', 'liq1', 'close', { update: { ...LIVE_OPEN, isOpen: false, changes: { isOpen: true, reasonClosed: null }, reasonClosed: 'liquidated', isLiquidated: true, closingPrice: 80000, createdAt } }),
+  tpEdit: post('alice', 'tp1', 'update', { update: { ...LIVE_OPEN, changes: { priceTarget: 0.26127 }, priceTarget: 0.23957, createdAt } }),
+  slEdit: post('alice', 'sl1', 'update', { update: { ...LIVE_OPEN, changes: { stopLoss: 80954 }, stopLoss: 82900, createdAt } }),
+  tpSlSet: post('alice', 'tpsl1', 'update', { update: { ...LIVE_OPEN, changes: { stopLoss: null, priceTarget: null }, priceTarget: 0.076919, stopLoss: 0.070122, createdAt } }),
+  // A live increase post and a live decrease post (real $ figures)
+  increase: post('alice', 'inc1', 'update', { update: { ...LIVE_OPEN, id: 'inv-live-inc', entrySim: 80.53886857221075, entryPrice: 2.5786782070371217, createdAt,
+    changes: { entrySim: 70.34890936617738, entrySize: 14.047592305655758, entryPrice: 2.6008252133242014, simIncrease: true, simDifference: 10.189959206033365,
+      liquidationPrice: 2.305915548065829, livePriceAtChange: 2.4355, percentDifference: 2.976566554744 } } }),
+  decrease: post('alice', 'dec1', 'update', { update: { ...LIVE_OPEN, id: 'inv-live-dec', entrySim: 6.181557905314414, entryPrice: 1.4794159498910233, createdAt,
+    changes: { entrySim: 7.104746541699936, entrySize: 1.0009523133710676, simIncrease: false, simDifference: 0.9237131278613635,
+      liquidationPrice: null, livePriceAtChange: 1.4795, percentDifference: 0.14936728595211007 } } }),
+});
+
+test('live feed shapes: only {isAdded:false} on an open trade is an open; closes and liquidations are closes; TP/SL edits and $-change posts are informational', async () => {
+  const ledger = ['open2', 'cl1', 'liq1'].map(t => copyEntry(`tx-${t}`, 'SOL', 0.5, 'alice', t));
+  const { invo, make } = setup({ ledger });
+  const w = make();
+  await w.poll(); // first run: index
+  const p = livePosts(new Date(clock).toISOString());
+  invo.publish(...Object.values(p));
+  const byTrade = Object.fromEntries(signals(await w.poll()).map(x => [x.mimicMeta.sourcePaperTradeBaseId, x]));
+  const action = (t: string) => byTrade[`base-${t}`]?.action;
+
+  assert.equal(action('open1'), 'open');
+  for (const t of ['open2', 'cl1', 'liq1']) assert.equal(action(t), 'close', t);
+  assert.equal(byTrade['base-liq1'].reasonClosed, 'liquidated');
+  assert.equal(byTrade['base-cl1'].reasonClosed, 'user_closed');
+  for (const t of ['tp1', 'sl1', 'tpsl1', 'inc1', 'dec1']) assert.equal(action(t), 'update', `${t}: never an open`);
+
+  // What trade.ts / close.ts / tpsl.ts would make of each
+  const open = parseTradeSignal(JSON.stringify(byTrade['base-open1']));
+  assert.equal(open.kind, 'open');
+  if (open.kind === 'open') {
+    assert.deepEqual([open.coin, open.side, open.leverage, open.entryPrice, open.tp, open.sl], ['SOL', 'long', 20, 86740, 87607, null]);
+  }
+  for (const t of ['open2', 'cl1', 'liq1']) assert.equal(parseTradeSignal(JSON.stringify(byTrade[`base-${t}`])).kind, 'close', t);
+  for (const t of ['tp1', 'sl1', 'tpsl1', 'inc1', 'dec1']) {
+    assert.throws(() => parseTradeSignal(JSON.stringify(byTrade[`base-${t}`])), /informational/, `${t}: refused as a trade`);
+  }
+});
+
+test('a TP/SL edit post is never taken as the $ figures of an add or partial close', async () => {
+  const { invo, make, advance } = setup({ following: ['alice'], ledger: [{ ...copyEntry('tx-a', 'SOL', 0.5, 'alice', 'tp1'), openedAt: '2026-10-02T00:00:00.000Z' }] });
+  const w = make();
+  await w.poll();
+  const tpPost = livePosts(new Date(clock).toISOString()).tpEdit;
+  invo.publish(tpPost);
+  // A /dex/trade increase claiming the TP edit post's id
+  invo.trades.push(dexTrade('alice', 'tp1', [{ updateType: 'increase', investmentId: tpPost.update.id, updatedAt: new Date(clock).toISOString(),
+    details: { positionSizeBefore: 0.05, positionSizeAfter: 0.1, positionSizeChange: 0.05 } }]));
+  assert.deepEqual(changeSignals(await w.poll()), []);
+  advance(121_000);
+  const events = await w.poll();
+  assert.deepEqual(changeSignals(events), []);
+  assert.deepEqual(alerts(events).map(a => [a.action, a.orderSent]), [['add', false]]);
+});
+
+test('live /dex/trade tp and sl updates (with and without the Before field) are tpsl signals only — refused by trade.ts and close.ts', async () => {
+  const { invo, make } = setup({ following: [], ledger: [{ ...copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1'), openedAt: '2026-10-02T00:00:00.000Z' }] });
+  invo.trades.push(dexTrade('alice', 't1', [
+    { updateType: 'tp', investmentId: 'i-tp', updatedAt: '2026-10-02T14:31:15.806Z', details: { priceTarget: 160, priceTargetBefore: 155 } },
+    { updateType: 'sl', investmentId: 'i-sl', updatedAt: '2026-10-02T14:31:20.000Z', details: { stopLoss: 120 } },
+  ]));
+  const s = changeSignals(await make().poll());
+  assert.deepEqual(s.map(x => [x.action, x.change.which, x.change.triggerPx]), [['tpsl', 'tp', 160], ['tpsl', 'sl', 120]]);
+  for (const sig of s) {
+    const parsed = parseTradeSignal(JSON.stringify(sig));
+    assert.equal(parsed.kind, 'tpsl');
+    assert.notEqual(parsed.kind, 'increase');
+  }
+});
+
+test('duplicates: the same open post or /dex/trade change seen again (next poll or after a restart) is emitted once', async () => {
+  const { invo, make } = setup({ ledger: [{ ...copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1'), openedAt: '2026-10-02T00:00:00.000Z' }] });
+  const w = make();
+  await w.poll();
+  const open = post('alice', 'dup1', 'open', { update: { ...LIVE_OPEN, createdAt: new Date(clock).toISOString() } });
+  invo.publish(open);
+  invo.trades.push(dexTrade('alice', 't1', [{ updateType: 'sl', investmentId: 'i-sl', updatedAt: '2026-10-02T14:31:20.000Z', details: { stopLoss: 120 } }]));
+  const first = signals(await w.poll()).map(x => x.action).sort();
+  assert.deepEqual(first, ['open', 'tpsl']);
+  assert.deepEqual(signals(await w.poll()), []);
+  assert.deepEqual(signals(await make().poll()), []); // restart: saved state
+});
+
+test('delays: a stale open or add is not copied; a delayed partial close or close still is (it only reduces)', async () => {
+  const { invo, make, advance } = setup({ following: ['alice'], ledger: [
+    { ...copyEntry('tx-a', 'SOL', 1, 'alice', 't1'), openedAt: '1970-01-01T00:00:00.000Z' },
+    { ...copyEntry('tx-b', 'SOL', 1, 'alice', 't2'), openedAt: '1970-01-01T00:00:00.000Z' },
+  ] });
+  const w = make();
+  await w.poll();
+  const old = new Date(clock).toISOString();
+  invo.publish(post('alice', 'late-open', 'open', { update: { ...LIVE_OPEN, createdAt: old } }));
+  advance(301_000);
+  invo.publish(changePost('alice', 't1', 'i-inc', 'increase', 0.5), changePost('alice', 't1', 'i-dec', 'decrease', 0.25));
+  invo.trades.push(dexTrade('alice', 't1', [
+    { updateType: 'increase', investmentId: 'i-inc', updatedAt: old, details: { positionSizeBefore: 0.1, positionSizeAfter: 0.15, positionSizeChange: 0.05 } },
+    { updateType: 'decrease', investmentId: 'i-dec', updatedAt: old, details: { positionSizeBefore: 0.15, positionSizeAfter: 0.1125, positionSizeChange: 0.0375 } },
+  ]), dexTrade('alice', 't2', [{ updateType: 'close', investmentId: 'i-close', updatedAt: old, details: { closePrice: 150, reasonClosed: 'user_closed' } }]));
+  const events = await w.poll();
+  const s = signals(events);
+  assert.ok(!s.some(x => x.action === 'open'), 'stale open not copied');
+  assert.ok(!s.some(x => x.action === 'increase'), 'stale add not copied');
+  assert.deepEqual(alerts(events).map(a => a.action), ['add']);
+  assert.ok(skipped(events).some(x => /posted \d+s ago — too old to copy/.test(x.reason)));
+  assert.deepEqual(s.filter(x => x.action === 'decrease').map(x => x.change.notional.investmentId), ['i-dec'], 'delayed partial close still sent, with its $ figures');
+  assert.deepEqual(s.filter(x => x.action === 'close').map(x => x.mimicMeta.sourcePaperTradeBaseId), ['base-t2'], 'delayed close still sent');
+});
+
+test('a /dex/trade change without a readable updatedAt or investmentId is alerted, never applied', async () => {
+  for (const u of [{ updateType: 'sl', updatedAt: 'not a date', details: { stopLoss: 120 } }, { updateType: 'tp', investmentId: '', details: { priceTarget: 160 } }]) {
+    const { invo, make } = setup({ following: [], ledger: [{ ...copyEntry('tx-a', 'SOL', 0.5, 'alice', 't1'), openedAt: '2026-10-02T00:00:00.000Z' }] });
+    invo.trades.push(dexTrade('alice', 't1', [u]));
+    const events = await make().poll();
+    assert.deepEqual(changeSignals(events), [], JSON.stringify(u));
+    assert.equal(alerts(events).length, 1, JSON.stringify(u));
+  }
 });

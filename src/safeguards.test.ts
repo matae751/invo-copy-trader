@@ -179,7 +179,7 @@ test('B2: the monitor stamps open signals with the post\'s time, and a restart a
   const state = { s: null as MonitorState | null, load() { return this.s && structuredClone(this.s); }, save(x: MonitorState) { this.s = structuredClone(x); } };
   const traders = [{ userId: 'alice', username: 'alice', portfolios: [{ id: 'p-alice' }] }];
   const make = () => new SignalWatcher({
-    invo: { async getFeed() { return { items: feed }; }, async getTradeUpdates() { return { success: true, data: [] }; } },
+    invo: { async getFeed() { return { items: feed }; }, async getTradeUpdates() { return { success: true, data: [] }; }, async getInvestmentStatus() { return null; } },
     registry: { traders, byUserId: new Map(traders.map(t => [t.userId, t])), async refreshIfDue() { return null; }, async refreshOnDemand() { return null; }, async refreshPortfolios() { return false; } },
     ledger: { load: () => [] },
     state,

@@ -39,6 +39,11 @@
 //    the user hears that the copy no longer matches the trader. Changes there is
 //    nothing to replicate for (copy gone, trade closed, made before our copy) stay
 //    quiet stderr `skipped` lines.
+//  - A /dex/trade updateType never seen live is never read as a close from its name.
+//    Invo's /investment/status is asked instead: closed → our copy is closed like any
+//    other close (plus an `unknown_update_closed` notice); open → change_not_replicated;
+//    unreadable → change_not_replicated, and the status is re-checked on later polls
+//    (up to maxStatusChecks) so a real close still closes the copy.
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -96,6 +101,19 @@ export interface ChangeNotional {
   seenAt: number;
 }
 
+/**
+ * A /dex/trade change of an unknown type to a trade we copied, waiting for Invo's
+ * /investment/status to say whether the trade is closed.
+ */
+export interface UnconfirmedChange {
+  entryId: string;
+  updateId: string;
+  update: any;
+  seenAt: number;
+  /** Status lookups made so far. */
+  checks: number;
+}
+
 /** An increase/decrease waiting for the feed post with its $ figures. */
 export interface PendingChange {
   entryId: string;
@@ -113,6 +131,8 @@ export interface MonitorState {
   /** Absent in state saved before changes were sized from feed posts. */
   changeNotionals?: ChangeNotional[];
   pendingChanges?: PendingChange[];
+  /** Absent in state saved before unknown update types were checked against the trade's status. */
+  unconfirmedChanges?: UnconfirmedChange[];
   savedAt: number;
 }
 
@@ -135,7 +155,8 @@ export class FileStateStore implements StateStore {
     if (!Array.isArray(data?.seenPostIds) || !Array.isArray(data?.seenTradeUpdates) || typeof data?.savedAt !== 'number' ||
         (data.closedTrades !== undefined && !Array.isArray(data.closedTrades)) ||
         (data.changeNotionals !== undefined && !Array.isArray(data.changeNotionals)) ||
-        (data.pendingChanges !== undefined && !Array.isArray(data.pendingChanges))) {
+        (data.pendingChanges !== undefined && !Array.isArray(data.pendingChanges)) ||
+        (data.unconfirmedChanges !== undefined && !Array.isArray(data.unconfirmedChanges))) {
       throw new Error(`monitor state ${this.path} is malformed`);
     }
     return data;
@@ -152,6 +173,8 @@ export class FileStateStore implements StateStore {
 export interface WatcherInvo {
   getFeed(filter: string, lastPostId: string | null, itemLimit: number): Promise<any>;
   getTradeUpdates(investments: WatchEntry[]): Promise<any>;
+  /** GET /investment/status/{baseId} — seen live: { status: { isOpen, exists }, success: true }. */
+  getInvestmentStatus(investmentBaseId: string): Promise<any>;
 }
 
 export interface WatcherRegistry {
@@ -186,6 +209,8 @@ export interface WatcherOptions {
   closedTradeRetentionMs?: number;
   /** How long an increase/decrease waits for the feed post with its $ figures before it is skipped. */
   notionalWaitMs?: number;
+  /** Status lookups (one per poll) for an unknown /dex/trade change whose status can't be read. */
+  maxStatusChecks?: number;
 }
 
 export interface WatchEvent {
@@ -206,6 +231,7 @@ export const DEFAULT_MAX_CLOSE_ATTEMPTS = 10;
 export const DEFAULT_CLOSED_TRADE_RETENTION_SEC = 24 * 3600;
 /** Feed posts for changes were seen ~6s after the change; 120s leaves room for a slow feed. */
 export const DEFAULT_NOTIONAL_WAIT_SEC = 120;
+export const DEFAULT_MAX_STATUS_CHECKS = 10;
 const MAX_NOTIONALS = 500;
 
 const finiteOrNull = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -235,13 +261,13 @@ function isCopyOf(c: CopyEntry, t: Partial<TradeIds>): boolean {
 }
 
 /**
- * A /dex/trade update that means the trade is over: updateType "close" (seen
- * live), or one naming a liquidation (not seen yet — either way the position is
- * gone, and close.ts only acts on a copy it matches).
+ * A /dex/trade update that means the trade is over: updateType "close". Every close
+ * seen live has this type, liquidations included (details.reasonClosed "liquidated",
+ * 6 of 86). Any other type is not guessed at from its name: on a copied trade the
+ * trade's status is checked (resolveUnconfirmedChanges).
  */
 export function isCloseUpdate(u: any): boolean {
-  const type = typeof u?.updateType === 'string' ? u.updateType.toLowerCase() : '';
-  return type === 'close' || type.includes('liquidat');
+  return typeof u?.updateType === 'string' && u.updateType.toLowerCase() === 'close';
 }
 
 const copyIds = (c: CopyEntry): TradeIds => ({
@@ -249,6 +275,18 @@ const copyIds = (c: CopyEntry): TradeIds => ({
   baseId: c.source!.sourcePaperTradeBaseId || undefined,
   baseShortId: c.source!.sourcePaperTradeBaseShortId || undefined,
 });
+
+const KNOWN_CHANGE_TYPES = new Set(['increase', 'decrease', 'tp', 'sl']);
+
+/**
+ * Whether Invo says the trade is open, from /investment/status; null if the response
+ * isn't the shape seen live (or the trade doesn't exist) — never read as either.
+ */
+export function investmentIsOpen(res: any): boolean | null {
+  const s = res?.status;
+  if (res?.success !== true || !s || typeof s !== 'object' || s.exists !== true || typeof s.isOpen !== 'boolean') return null;
+  return s.isOpen;
+}
 
 /** When the post was made (ms), from post.createdAt (ISO string or epoch ms); null if absent/unreadable. */
 export function postTime(post: any): number | null {
@@ -263,6 +301,7 @@ export class SignalWatcher {
   private closed: ClosedTrade[] = [];
   private notionals = new Map<string, ChangeNotional>();
   private pending: PendingChange[] = [];
+  private unconfirmed: UnconfirmedChange[] = [];
   /** Closed trades first seen in the current poll. */
   private closedThisPoll = new Set<ClosedTrade>();
   private started = false;
@@ -298,6 +337,7 @@ export class SignalWatcher {
         this.closed = saved.closedTrades ?? [];
         for (const n of saved.changeNotionals ?? []) this.notionals.set(n.investmentId, n);
         this.pending = saved.pendingChanges ?? [];
+        this.unconfirmed = saved.unconfirmedChanges ?? [];
         gapMs = Math.max(0, this.now - saved.savedAt);
       }
     }
@@ -318,6 +358,7 @@ export class SignalWatcher {
       copies.some(c => sameTrade({ ownerId, baseId, baseShortId }, copyIds(c)));
 
     await this.pollTradeUpdates(copies, fresh, first && !fresh, out, err);
+    if (ledgerReadable) await this.resolveUnconfirmedChanges(copies, first && !fresh, out, err);
     await this.pollFeed({ first, fresh, gapMs, maxCatchUpMs, isCopied, ledgerReadable }, out, err);
     if (ledgerReadable) this.emitPendingChanges(copies, out, err);
     this.emitCloses(copies, ledgerReadable, out);
@@ -331,6 +372,7 @@ export class SignalWatcher {
         closedTrades: this.closed,
         changeNotionals: [...this.notionals.values()].sort((a, b) => a.seenAt - b.seenAt).slice(-MAX_NOTIONALS),
         pendingChanges: this.pending,
+        unconfirmedChanges: this.unconfirmed,
         savedAt: this.now,
       });
     } catch (e: any) {
@@ -372,7 +414,8 @@ export class SignalWatcher {
     //   { success, data: [ { creatorAppUserId, portfolioId, investmentBaseId, investmentBaseShortId,
     //       unmimickedCount, unseenCount,
     //       updates: [ { investmentId, investmentBaseId, updateType, updatedAt, isSeen, isMimicked, details } ] } ] }
-    // updateType seen: "close" (details: closePrice, reasonClosed), "tp", "sl". There is no isOpen field.
+    // updateType seen: "close" (details: closePrice, reasonClosed), "tp", "sl", "increase", "decrease".
+    // There is no isOpen field.
     let trades: any[];
     try {
       const res = await this.o.invo.getTradeUpdates([...watch.values()]);
@@ -412,7 +455,7 @@ export class SignalWatcher {
           // Sent by emitCloses (and re-sent while the copy stays open) — even on a fresh start
           this.rememberClose({
             ...copyIds(copy), coin: copy.coin, closingPrice: u.details?.closePrice ?? null,
-            reasonClosed: u.details?.reasonClosed ?? (String(u.updateType).toLowerCase().includes('liquidat') ? 'liquidated' : null),
+            reasonClosed: u.details?.reasonClosed ?? null,
             source: 'trade_poll', catchUp,
           });
         } else {
@@ -430,10 +473,92 @@ export class SignalWatcher {
         if (!this.pending.some(p => p.updateId === c.updateId)) {
           this.pending.push({ entryId: c.copy.id, updateId: c.updateId, update: c.u, seenAt: this.now });
         }
+      } else if (!KNOWN_CHANGE_TYPES.has(type)) {
+        // Never guessed from its name: the trade's status decides (resolveUnconfirmedChanges)
+        if (!this.unconfirmed.some(p => p.updateId === c.updateId)) {
+          this.unconfirmed.push({ entryId: c.copy.id, updateId: c.updateId, update: c.u, seenAt: this.now, checks: 0 });
+        }
       } else {
         this.emitChange(c.copy, c.u, c.updateId, out, err);
       }
     }
+  }
+
+  /**
+   * An unknown /dex/trade change to a copied trade: ask Invo whether the trade is still open.
+   * Closed → the copy is closed (rememberClose → emitCloses). Open → alerted. Unreadable →
+   * alerted once, then re-checked each poll up to maxStatusChecks, in case it was a close.
+   */
+  private async resolveUnconfirmedChanges(
+    copies: CopyEntry[],
+    catchUp: boolean,
+    out: (d: Record<string, unknown>, signal?: boolean) => void,
+    err: (d: Record<string, unknown>) => void,
+  ) {
+    const maxChecks = this.o.maxStatusChecks ?? DEFAULT_MAX_STATUS_CHECKS;
+    const keep: UnconfirmedChange[] = [];
+    for (const p of this.unconfirmed) {
+      const u = p.update;
+      const copy = copies.find(c => c.id === p.entryId);
+      const label = `unknown /dex/trade updateType ${JSON.stringify(u?.updateType ?? null)}`;
+      const skip = (reason: string) => err({
+        type: 'skipped', poll: this.pollCount, source: 'trade_poll', updateType: u?.updateType ?? null, updatedAt: u?.updatedAt ?? null,
+        entryId: p.entryId, ownerId: copy?.source?.creatorInvoUserId ?? null, coin: copy?.coin ?? null, reason,
+      });
+      if (!copy) { skip(`${label} on a copy that is no longer open — nothing to replicate`); continue; }
+      if (this.closedTradeFor(copyIds(copy))) { skip(`${label} on a trade that is already closed`); continue; }
+      const baseId = copy.source!.sourcePaperTradeBaseId;
+      if (!baseId) {
+        this.notReplicated(copy, u, `${label} and no trade baseId to check its status with — not replicated, check it`, out);
+        continue;
+      }
+
+      let isOpen: boolean | null = null;
+      let why = '';
+      try {
+        const res = await this.o.invo.getInvestmentStatus(baseId);
+        isOpen = investmentIsOpen(res);
+        if (isOpen === null) why = `unrecognised /investment/status response: ${JSON.stringify(res)?.slice(0, 200)}`;
+      } catch (e: any) {
+        why = e.message;
+      }
+      p.checks++;
+
+      if (isOpen === false) {
+        this.rememberClose({
+          ...copyIds(copy), coin: copy.coin, closingPrice: finiteOrNull(u?.details?.closePrice),
+          reasonClosed: typeof u?.details?.reasonClosed === 'string' && u.details.reasonClosed ? u.details.reasonClosed : null,
+          source: 'trade_poll', catchUp,
+        });
+        out({
+          type: 'unknown_update_closed',
+          poll: this.pollCount,
+          message: `${label} on ${copy.coin} (trade ${copy.source!.sourcePaperTradeBaseShortId ?? baseId}): Invo reports the trade closed — ` +
+            `our copy is being closed like any other close. Check what this update type is.`,
+          entryId: copy.id,
+          coin: copy.coin,
+          change: { updateType: u?.updateType ?? null, updatedAt: u?.updatedAt ?? null, investmentId: u?.investmentId ?? null, details: u?.details ?? null },
+        });
+      } else if (isOpen === true) {
+        if (p.checks === 1) {
+          this.notReplicated(copy, u, `${label} — Invo reports the trade still open, so it is not a close; not replicated, check it`, out);
+        } else {
+          skip(`${label}: Invo now reports the trade still open — already alerted, no close`);
+        }
+      } else {
+        if (p.checks === 1) {
+          this.notReplicated(copy, u, `${label} — the trade's status couldn't be read (${why}); not replicated, ` +
+            `re-checking it for a close for up to ${maxChecks} polls`, out);
+        }
+        if (p.checks < maxChecks) {
+          keep.push(p);
+        } else {
+          err({ type: 'error', source: 'trade_status', entryId: copy.id, coin: copy.coin, updateType: u?.updateType ?? null,
+            message: `${label}: trade status still unreadable after ${p.checks} checks (${why}) — no longer re-checked; the copy stays open` });
+        }
+      }
+    }
+    this.unconfirmed = keep;
   }
 
   /** Remember the $ figures of every change post in the feed (see ChangeNotional). */
@@ -564,6 +689,7 @@ export class SignalWatcher {
       entryId: copy.id, ownerId: src.creatorInvoUserId, coin: copy.coin, reason,
     });
     const at = typeof u?.updatedAt === 'string' ? Date.parse(u.updatedAt) : NaN;
+    if (this.closedTradeFor(copyIds(copy))) { skip(`${type} of a trade that is already closed`); return; }
 
     let action: 'increase' | 'decrease' | 'tpsl';
     let change: Record<string, unknown>;
@@ -602,7 +728,6 @@ export class SignalWatcher {
       this.notReplicated(copy, u, `${type} without a readable updatedAt / investmentId — can't be applied exactly once, not replicated`, out);
       return;
     }
-    if (this.closedTradeFor(copyIds(copy))) { skip(`${type} of a trade that is already closed`); return; }
     if (action !== 'tpsl' && at < Date.parse(copy.openedAt)) {
       skip(`${type} made before our copy opened (our size is set from our equity at open) — nothing to replicate`);
       return;
