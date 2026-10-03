@@ -277,7 +277,23 @@ async function signalClose(
   // all of it when they closed all (or the remainder rounds to nothing)
   let plan = full;
   if (decrease && decrease.fraction < 1) {
+    // The fraction is of our tracked copy, so the live position must still hold it in full
+    // (plus every other copy in the coin). Smaller means something reduced it outside the
+    // ledger: the copy's real size is unknown, and closing a fraction of the ledger figure
+    // could take more than the trader's share of what is actually ours.
+    const eps = qtyEpsilon(szDecimals);
+    const tracked = entries
+      .filter(e => e.status === 'open' && e.coin === coin)
+      .reduce((sum, e) => sum + e.qty, 0);
+    if (Math.abs(before.szi) < tracked - eps) {
+      return refuse(coin, `the ${coin} position (${Math.abs(before.szi)}) is smaller than the copies tracked in it ` +
+        `(${roundQty(tracked, szDecimals)}) — our copy's real size is unknown, so the trader's ` +
+        `${(decrease.fraction * 100).toFixed(2)}% decrease can't be replicated exactly`, entry.id, session.settled);
+    }
     const qty = floorQty(entry.qty * decrease.fraction, szDecimals);
+    if (qty > entry.qty + eps) {
+      return refuse(coin, `decrease of ${qty} ${coin} exceeds our ${entry.qty} copy`, entry.id, session.settled);
+    }
     const left = roundQty(entry.qty - qty, szDecimals);
     if (qty < qtyEpsilon(szDecimals)) {
       return refuse(coin, `the trader's ${(decrease.fraction * 100).toFixed(2)}% decrease of our ${entry.qty} ${coin} copy rounds to zero at ${szDecimals} decimals`, entry.id, session.settled);

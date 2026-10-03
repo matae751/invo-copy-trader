@@ -14,6 +14,7 @@ import {
   sizeIncrease,
   tierTargetUsd,
   SLIPPAGE_PCT,
+  MAX_EQUITY_PCT,
 } from './sizing.js';
 import { getTraderStats, type TraderStatsClient } from './trader-stats.js';
 import { MANUAL_TRADE_ARG, type MimicMeta } from './mimic-meta.js';
@@ -32,7 +33,15 @@ import {
 } from './copy-ledger.js';
 import { assertHlOk, orderFilledQty, orderRejection } from './hl-response.js';
 import { settlePendingOrders, type OrderLookup } from './pending-orders.js';
-import { isSignalArg, parseTradeSignal, MAX_CHANGE_AGE_MS, type IncreaseSignal, type OpenSignal } from './trade-signal.js';
+import {
+  isSignalArg,
+  parseTradeSignal,
+  MAX_CHANGE_AGE_MS,
+  MAX_CLOCK_SKEW_MS,
+  MAX_OPEN_AGE_MS,
+  type IncreaseSignal,
+  type OpenSignal,
+} from './trade-signal.js';
 import { coinTriggers, replaceTpsl, type TpslHl, type TpslOutcome } from './tpsl-exec.js';
 
 export interface HlMeta {
@@ -184,10 +193,26 @@ async function execute(req: Request, deps: TradeDeps) {
   const updateId = req.mode === 'open' ? mimicMetaArg?.initialSourcePaperUpdateId ?? null : req.sig.updateId;
 
   // --- Checked before Hyperliquid is touched ---
+  if (copy) {
+    // A stale open (saved, delayed, replayed after a restart) is never traded
+    if (!copy.postedAt) {
+      throw new Error('open signal has no readable postedAt — can\'t tell how old it is, not copying (re-run the monitor; its signals include it)');
+    }
+    const ageMs = now().getTime() - Date.parse(copy.postedAt);
+    if (ageMs > MAX_OPEN_AGE_MS) {
+      throw new Error(`The trader's open was posted ${Math.round(ageMs / 1000)}s ago — too old to copy (max ${MAX_OPEN_AGE_MS / 1000}s)`);
+    }
+    if (ageMs < -MAX_CLOCK_SKEW_MS) {
+      throw new Error(`open signal postedAt ${copy.postedAt} is ${Math.round(-ageMs / 1000)}s in the future — unreadable time, not copying`);
+    }
+  }
   if (req.mode === 'increase') {
     const ageMs = now().getTime() - Date.parse(req.sig.updatedAt);
     if (ageMs > MAX_CHANGE_AGE_MS) {
       throw new Error(`The trader's increase was ${Math.round(ageMs / 1000)}s ago — too old to copy at today's price (max ${MAX_CHANGE_AGE_MS / 1000}s)`);
+    }
+    if (ageMs < -MAX_CLOCK_SKEW_MS) {
+      throw new Error(`increase signal updatedAt ${req.sig.updatedAt} is ${Math.round(-ageMs / 1000)}s in the future — unreadable time, not copying`);
     }
   }
   // Read the ledger before trading: a copy we can't record could never be closed by its trader's signal
@@ -310,14 +335,26 @@ async function execute(req: Request, deps: TradeDeps) {
   // Size — the only thing not copied from the trader: always from our own equity.
   //   open:     the tier's % of equity, clamped to 5–15% of equity
   //   increase: the trader's add in proportion to our copy (their change / their size before),
-  //             capped at the tier's % of equity (≤ 15%) and at 80% of the copy's notional
+  //             never more than any of:
+  //               - the tier's % of equity (≤ 15%) for this add
+  //               - what keeps the whole copy within 15% of equity (MAX_EQUITY_PCT)
+  //               - 80% of the current notional (the smaller of this copy and the whole coin position)
   // Bounds hold at the worst-case fill (orderPx ± SLIPPAGE_PCT), not just at mid.
   const tierUsd = Math.min(tierTargetUsd(range.equityUsd, perf.equityPct), range.maxUsd);
   const copyNotionalUsd = target ? target.qty * mid : 0;
+  const positionNotionalUsd = Math.abs(existingSzi) * mid;
   const mirroredUsd = req.mode === 'increase' ? copyNotionalUsd * req.sig.ratio : null;
-  const targetUsd = mirroredUsd === null ? tierUsd : Math.min(mirroredUsd, tierUsd);
+  // Room left under the 15% cap on the copy's total size, valued at today's mid
+  const copyHeadroomUsd = req.mode === 'increase' ? range.maxUsd - copyNotionalUsd : null;
+  if (copyHeadroomUsd !== null && copyHeadroomUsd <= 0) {
+    throw new Error(
+      `Can't copy the increase: our ${coin} copy is already $${copyNotionalUsd.toFixed(2)}, at or above ` +
+      `${MAX_EQUITY_PCT}% of equity ($${range.maxUsd.toFixed(2)}) — the maximum a copy may reach`,
+    );
+  }
+  const targetUsd = mirroredUsd === null ? tierUsd : Math.min(mirroredUsd, tierUsd, copyHeadroomUsd!);
   const sizing = req.mode === 'increase'
-    ? sizeIncrease(targetUsd, copyNotionalUsd, mid, szDecimals, isBuy, SLIPPAGE_PCT)
+    ? sizeIncrease(targetUsd, Math.min(copyNotionalUsd, positionNotionalUsd), mid, szDecimals, isBuy, SLIPPAGE_PCT)
     : sizeInitial(targetUsd, range, orderPx, szDecimals, isBuy, SLIPPAGE_PCT);
   const sizeStr = sizing.qty;
 
@@ -379,6 +416,7 @@ async function execute(req: Request, deps: TradeDeps) {
       maxUsd: round2(range.maxUsd),
       targetUsd: round2(targetUsd),
       ...(mirroredUsd !== null && { mirroredUsd: round2(mirroredUsd) }),
+      ...(copyHeadroomUsd !== null && { copyHeadroomUsd: round2(copyHeadroomUsd), positionNotionalUsd: round2(positionNotionalUsd) }),
       notionalUsd: sizing.notionalUsd,
       minFillNotionalUsd: sizing.minFillNotionalUsd,
       maxFillNotionalUsd: sizing.maxFillNotionalUsd,

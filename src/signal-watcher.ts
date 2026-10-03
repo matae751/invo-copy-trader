@@ -624,6 +624,8 @@ export class SignalWatcher {
         source: 'feed',
         poll: this.pollCount,
         postId: post.id,
+        // When the post was made: trade.ts refuses an open whose post is too old
+        postedAt: new Date(postTime(post)!).toISOString(),
         action: verdict.action,
         ...(verdict.copied && { copied: true }),
         ...(catchUp && { catchUp: true }),

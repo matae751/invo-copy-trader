@@ -12,6 +12,14 @@ import { parseCloseIdentity, type CloseIdentity, type Side } from './copy-ledger
 
 /** An increase older than this is a trade at a stale price: refused (the monitor skips them too). */
 export const MAX_CHANGE_AGE_MS = 300_000;
+/**
+ * An open signal whose post is older than this is refused by trade.ts itself, so a
+ * saved, delayed or replayed signal can't open a trade the trader may have left
+ * (the monitor's --max-signal-age filters them first; this holds whatever it was set to).
+ */
+export const MAX_OPEN_AGE_MS = 300_000;
+/** Clock skew tolerated for a post time in the future; more than this is refused as unreadable. */
+export const MAX_CLOCK_SKEW_MS = 60_000;
 
 export type TpslKind = 'tp' | 'sl';
 
@@ -27,6 +35,8 @@ export interface OpenSignal {
   sl: number | null;
   /** When the trader opened (their trade's createdAt), if the signal says. */
   traderOpenedAt: string | null;
+  /** When the feed post announcing the open was made (signal.postedAt); null if the signal doesn't say. */
+  postedAt: string | null;
   mimicMeta: MimicMeta;
 }
 
@@ -136,6 +146,7 @@ export function parseTradeSignal(arg: string): TradeSignal {
         tp: optionalPrice(t, 'priceTarget', 'take-profit'),
         sl: optionalPrice(t, 'stopLoss', 'stop-loss'),
         traderOpenedAt: openedAt,
+        postedAt: nonEmpty(sig.postedAt) && Number.isFinite(Date.parse(sig.postedAt)) ? sig.postedAt : null,
         mimicMeta: parseMimicMeta(sig.mimicMeta),
       };
     }

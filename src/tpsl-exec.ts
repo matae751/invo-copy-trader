@@ -29,6 +29,8 @@ export interface OpenOrder {
   coin: string;
   cloid?: string | null;
   isTrigger?: boolean;
+  isPositionTpsl?: boolean;
+  reduceOnly?: boolean;
   orderType?: string;
   triggerPx?: string;
 }
@@ -62,8 +64,19 @@ export function tpslKindOf(o: Pick<OpenOrder, 'isTrigger' | 'orderType'>): TpslK
   return null;
 }
 
-/** TP/SL trigger orders open in `coin`. */
-export const coinTriggers = (orders: OpenOrder[], coin: string) => orders.filter(o => o.coin === coin && tpslKindOf(o));
+/**
+ * Could this order close (part of) a position when a price is reached? Fails closed:
+ * any trigger, any position TP/SL, or an order type naming a take-profit / stop —
+ * whatever its exact wording — counts, so an unexpected label can't hide one.
+ */
+export function isTriggerLike(o: Pick<OpenOrder, 'isTrigger' | 'isPositionTpsl' | 'orderType'>): boolean {
+  if (o.isTrigger === true || o.isPositionTpsl === true) return true;
+  const t = (o.orderType ?? '').toLowerCase();
+  return /take ?profit|stop|trigger|tp\b|sl\b/.test(t);
+}
+
+/** Trigger-like orders open in `coin` (see isTriggerLike). */
+export const coinTriggers = (orders: OpenOrder[], coin: string) => orders.filter(o => o.coin === coin && isTriggerLike(o));
 
 export type TpslOutcome =
   | { which: TpslKind; status: 'active'; triggerPx: number; cloid: string; replacedCloid?: string }
@@ -245,12 +258,14 @@ export async function runTpsl(args: string[], deps: TpslDeps): Promise<TpslResul
   } catch (e: any) {
     return refuse(coin, `can't read open orders: ${e.message}`, entry.id);
   }
-  for (const it of todo) {
-    const ours = entry.tpsl?.[it.which]?.cloid;
-    const foreign = coinTriggers(openOrders, coin).filter(o => tpslKindOf(o) === it.which && o.cloid !== ours);
-    if (foreign.length) {
-      return refuse(coin, `${coin} has a ${it.which} order this copy didn't place (cloid ${foreign[0].cloid ?? 'none'}) — not replacing it`, entry.id);
-    }
+  // Every trigger-like order in the coin must be one this copy placed. One whose kind
+  // can't be read, or that we didn't place, would act on the copy too: refuse.
+  const ourCloids = new Set(Object.values(entry.tpsl ?? {}).map(t => t!.cloid));
+  const foreign = coinTriggers(openOrders, coin).filter(o => !o.cloid || !ourCloids.has(o.cloid));
+  if (foreign.length) {
+    const f = foreign[0];
+    return refuse(coin, `${coin} has a trigger/TP/SL order this copy didn't place (${f.orderType ?? 'unknown type'}, cloid ${f.cloid ?? 'none'}) — ` +
+      `it would act on the copy too, so the trader's TP/SL can't be replicated on its own`, entry.id);
   }
 
   const outcomes: TpslOutcome[] = [];

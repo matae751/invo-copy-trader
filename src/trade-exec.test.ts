@@ -26,7 +26,7 @@ const open = (coin: string, side: 'long' | 'short', leverage: number, trader: st
   [openSignal(coin, side, leverage, trader, tradeId, trade)];
 function openSignal(coin: string, side: 'long' | 'short', leverage: number, trader: string, tradeId: string, trade: Record<string, unknown> = {}) {
   return JSON.stringify({
-    type: 'signal', source: 'feed', action: 'open',
+    type: 'signal', source: 'feed', action: 'open', postedAt: '2026-10-02T11:59:40.000Z',
     trade: { coin, side, leverage, entryPrice: MIDS[coin], isOpen: true, priceTarget: null, stopLoss: null, openedAt: '2026-10-02T11:59:30.000Z', ...trade },
     mimicMeta: signalMeta(trader, tradeId),
   });
@@ -223,7 +223,7 @@ test('unreadable equity stops the trade before any order', async () => {
   await assert.rejects(trade(open('SOL', 'long', 5, 'alice', 't2')), /Invalid account equity/);
 });
 
-test('an increase mirrors the trader\'s add in proportion to our copy, capped at the tier % and 80% of the copy', async () => {
+test('an increase mirrors the trader\'s add in proportion to our copy, capped at the tier %, 15% of equity per copy and 80% of the copy', async () => {
   const withCopy = (qty: number) => setup({ equity: 2000, positions: { SOL: qty }, ledger: new MemoryLedgerStore([{ ...copyEntry('tx-a', 'SOL', qty, 'alice', 't1'), leverage: 5 }]) });
 
   // Trader adds 25% → our 2 SOL copy ($200) adds $50: 0.49 SOL (≤ $50 at the worst-case fill)
@@ -239,10 +239,10 @@ test('an increase mirrors the trader\'s add in proportion to our copy, capped at
   const b = await capped.trade(increase('alice', 't1', 1));
   assert.deepEqual([b.sizing.mirroredUsd, b.sizing.capUsd, b.size], [100, 80, '0.78']);
 
-  // Trader triples a $1,000 copy → $3,000 mirrored, capped at the strong tier's 15% of equity ($300)
+  // A $1,000 copy on $2,000 of equity is already over the 15% ($300) a copy may reach: no add at all
   const big = withCopy(10);
-  const c = await big.trade(increase('alice', 't1', 3));
-  assert.deepEqual([c.sizing.mirroredUsd, c.sizing.targetUsd, c.sizing.capUsd, c.size], [3000, 300, 800, '2.94']);
+  await assert.rejects(big.trade(increase('alice', 't1', 3)), /already \$1000\.00, at or above 15% of equity \(\$300\.00\)/);
+  assert.ok(!big.hl.calls.includes('placeMarketOrder'));
 
   // A tiny add that comes to under HL's $10 minimum can't be replicated
   const tiny = withCopy(1);

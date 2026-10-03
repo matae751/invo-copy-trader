@@ -32,7 +32,7 @@ const ident = (trader: string, tradeId: string) => {
   return m;
 };
 const openSig = (trade: Record<string, unknown> = {}, trader = 'alice', tradeId = 't1') => JSON.stringify({
-  type: 'signal', action: 'open',
+  type: 'signal', action: 'open', postedAt: '2026-10-02T11:59:40.000Z',
   trade: { coin: 'SOL', side: 'long', leverage: 5, entryPrice: 100, isOpen: true, priceTarget: null, stopLoss: null, openedAt: '2026-10-02T11:59:30.000Z', ...trade },
   mimicMeta: signalMeta(trader, tradeId),
 });
