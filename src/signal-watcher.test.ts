@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { SignalWatcher, DEFAULT_CLOSE_RETRY_SEC, type MonitorState, type StateStore, type WatchEntry } from './signal-watcher.js';
 import { MIN_SETTLE_AGE_MS } from './pending-orders.js';
+import { parseTradeSignal } from './trade-signal.js';
 import type { FollowedTrader } from './following.js';
 import type { CopyEntry } from './copy-ledger.js';
 import { copyEntry, notionalFor } from './test-fakes.js';
@@ -164,6 +165,26 @@ test('first ever run indexes the feed without emitting; later posts are signals'
   invo.publish(post('alice', 't1'));
   const s = signals(await w.poll());
   assert.deepEqual(s.map(x => [x.action, x.mimicMeta.sourcePaperTradeBaseId, x.catchUp]), [['open', 'base-t1', undefined]]);
+});
+
+test('an open\'s side comes only from a boolean directionLong; missing or unreadable is left out and trade.ts refuses it', async () => {
+  const { invo, make } = setup();
+  const w = make();
+  await w.poll(); // first run: index
+  const cases: [unknown, string | undefined][] = [[true, 'long'], [false, 'short'], [undefined, undefined], [null, undefined], ['true', undefined], [1, undefined]];
+  for (const [directionLong, want] of cases) {
+    // A complete open apart from the side, so only the side can make trade.ts refuse it
+    const p = post('alice', `t-${String(directionLong)}`, 'open', { update: { leverage: 5, entryPrice: 150, priceTarget: null, stopLoss: null } });
+    if (directionLong !== undefined) (p.update as any).directionLong = directionLong;
+    invo.publish(p);
+    const [sig] = signals(await w.poll());
+    assert.equal(sig.action, 'open', String(directionLong));
+    assert.equal(sig.trade.side, want, `directionLong ${JSON.stringify(directionLong)}`);
+    if (want === undefined) {
+      assert.ok(!('side' in sig.trade), `directionLong ${JSON.stringify(directionLong)}: no side key`);
+      assert.throws(() => parseTradeSignal(JSON.stringify(sig)), /trade\.side must be "long" or "short"/);
+    }
+  }
 });
 
 test('a restart catches up on posts made while stopped (the --wait-for-signal gap)', async () => {

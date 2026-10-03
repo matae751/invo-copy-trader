@@ -843,7 +843,8 @@ export class SignalWatcher {
         trade: {
           coin: update.ticker,
           name: update.name,
-          side: update.directionLong ? 'long' : 'short',
+          // Left out unless Invo says which, so trade.ts refuses rather than assume a direction
+          ...(typeof update.directionLong === 'boolean' && { side: update.directionLong ? 'long' : 'short' }),
           leverage: update.leverage,
           entryPrice: update.entryPrice,
           closingPrice: update.closingPrice ?? null,
