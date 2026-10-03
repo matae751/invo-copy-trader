@@ -11,12 +11,31 @@ function toSdkCoin(coin: string): string {
 
 let sdk: Hyperliquid | null = null;
 
+/**
+ * The SDK (1.7.x) sends a signed `setReferrer` action (code "PLACEHOLDER") on its own the
+ * first time any exchange call resolves a coin (exchange.getAssetIndex → setTimeout →
+ * setReferrer()), guarded by a private once-flag `_i`. That's an exchange write nobody asked
+ * for, so it is switched off before anything is sent: the flag is set (never scheduled) and
+ * setReferrer itself throws. Fails closed if the SDK's shape isn't what this expects.
+ */
+export function disableSdkReferrer(s: Hyperliquid): void {
+  const ex = (s as any).exchange;
+  if (!ex || typeof ex.setReferrer !== 'function' || typeof ex.getAssetIndex !== 'function' || !('_i' in ex)) {
+    throw new Error('Hyperliquid SDK shape changed — refusing to connect until the automatic setReferrer call is re-checked (see hl-client.ts)');
+  }
+  ex._i = 1;
+  ex.setReferrer = () => {
+    throw new Error('setReferrer is disabled: this tool never changes the account referrer');
+  };
+}
+
 export async function connect(agentKey: string, walletAddress: string): Promise<Hyperliquid> {
   sdk = new Hyperliquid({
     privateKey: agentKey,
     walletAddress,
     enableWs: false,
   });
+  disableSdkReferrer(sdk);
   await withTimeout(sdk.connect(), 'Hyperliquid connect');
   return sdk;
 }
